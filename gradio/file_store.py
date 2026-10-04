@@ -17,6 +17,7 @@ With no store configured the in-process behavior is unchanged.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -24,6 +25,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 FILE_STORE_ENV_VAR = "GRADIO_FILE_STORE"
 
@@ -197,7 +200,7 @@ class HfBucketFileStore:
     def resolve(self, key, principal):
         try:
             owner = self._owner_record(key)
-        except Exception:
+        except Exception:  # a missing or unreadable record is a miss, not an error
             return None
         if owner is None or owner.get("owner") != principal:
             return None
@@ -244,7 +247,8 @@ class HfBucketFileStore:
             key = entry.path[len(prefix) : -len(".json")]
             try:
                 owner = self._owner_record(key)
-            except Exception:
+            except Exception:  # an unreadable sidecar is skipped, not fatal
+                logger.debug("file gc: unreadable owner record %r", key)
                 continue
             if owner is None:
                 continue
