@@ -80,8 +80,9 @@ from gradio.exceptions import (
 from gradio.helpers import create_tracker, skip, special_args
 from gradio.i18n import I18n, I18nData
 from gradio.node_server import start_node_server
-from gradio.route_utils import API_PREFIX, MediaStream, slugify
+from gradio.route_utils import API_PREFIX, MediaStream, principal_from_request, slugify
 from gradio.routes import INTERNAL_ROUTES, VERSION, App, Request
+from gradio.session_store import SessionRecord, SessionStore
 from gradio.state_holder import SessionState, StateHolder
 from gradio.themes import ThemeClass as Theme
 from gradio.tunneling import (
@@ -1386,6 +1387,10 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
         self.extra_startup_events: list[Callable[..., Coroutine[Any, Any, Any]]] = []
         self.renderables: list[Renderable] = []
         self.state_holder: StateHolder
+        # When set, session reads and writes route through this store instead of
+        # this process's `state_holder`. Left None by default, so the in-process
+        # path is unchanged until an external store opts in (R12).
+        self.session_store: SessionStore | None = None
         self.custom_mount_path: str | None = None
         self.pwa = False
         self.mcp_server = False
@@ -2633,6 +2638,16 @@ Received inputs:
         if isinstance(block_fn, int):
             block_fn = self.fns[block_fn]
         batch = block_fn.batch
+        principal = principal_from_request(request)
+        # Fallback for a caller that reached process_api without a resolved
+        # state: route it through the store rather than mint an empty local
+        # session behind it (R1, R3). In-process callers pass a state already.
+        if (
+            state is None
+            and session_hash is not None
+            and self.session_store is not None
+        ):
+            state = self.get_session_state(session_hash, principal, create=True)
         state_ids_to_track, hashed_values = self.get_state_ids_to_track(block_fn, state)
         changed_state_ids = []
         LocalContext.blocks.set(self)
@@ -2787,7 +2802,117 @@ Received inputs:
                     output["render_config"], root_path, None
                 )
 
+        if (
+            state is not None
+            and session_hash is not None
+            and self.session_store is not None
+        ):
+            self.save_session_state(state, session_hash, principal)
+
         return output
+
+    def get_session_state(
+        self,
+        session_hash: str | None,
+        principal: str | None = None,
+        *,
+        create: bool = True,
+    ) -> SessionState | None:
+        """Resolve a session through the configured store.
+
+        With no external store this is the in-process ``StateHolder`` path,
+        unchanged. With an external store, the record is loaded and a
+        ``SessionState`` is rebuilt from this replica's own app config (KTD8).
+        A record owned by another principal resolves to ``None`` rather than
+        being read or taken over (R17, KTD9).
+        """
+        store = self.session_store
+        if store is None:
+            # Default in-process path: the live holder object, exactly as before.
+            if session_hash is None:
+                return SessionState(self)
+            if create:
+                return self.state_holder[session_hash]
+            return self.state_holder.session_data.get(session_hash)
+
+        if session_hash is None:
+            return SessionState(self) if create else None
+
+        # Resolve before creating, so a record with a different owner is never
+        # silently taken over.
+        record = store.resolve(session_hash, principal)
+        if record is None:
+            if session_hash in store:
+                return None  # exists, owned by another principal
+            if not create:
+                return None
+            record = store.create(session_hash, principal)
+        if record.principal != principal:
+            return None
+        return self._session_state_from_record(record)
+
+    def _session_state_from_record(self, record: SessionRecord) -> SessionState:
+        state = SessionState(self)
+        state.state_data.update(record.state_data)
+        state.is_closed = record.is_closed
+        state._session_record = record  # type: ignore[attr-defined]
+        state._session_snapshot = dict(record.state_data)  # type: ignore[attr-defined]
+        return state
+
+    def save_session_state(
+        self,
+        state: SessionState,
+        session_hash: str,
+        principal: str | None = None,
+    ) -> bool:
+        """Persist a session through the configured store.
+
+        A no-op for the in-process default, where the state object is live in
+        the holder. On the external path, a stale version is retried by
+        re-reading and re-applying only the keys this turn changed, so a
+        concurrent turn of the same session does not lose an update (KTD5).
+        """
+        store = self.session_store
+        if store is None:
+            return True
+
+        record = getattr(state, "_session_record", None)
+        if record is None:
+            record = SessionRecord(session_hash=session_hash, principal=principal)
+
+        # The keys this turn changed relative to what it loaded, used to merge
+        # onto a newer version if another turn wrote first.
+        snapshot = getattr(state, "_session_snapshot", None)
+        current = dict(state.state_data)
+        changed = (
+            current
+            if snapshot is None
+            else {k: v for k, v in current.items() if snapshot.get(k) != v}
+        )
+        deleted = set(snapshot or {}) - set(current)
+
+        expected = record.version
+        for _ in range(8):
+            record.session_hash = session_hash
+            record.principal = principal
+            record.state_data = dict(state.state_data)
+            record.is_closed = state.is_closed
+            if store.save(record, expected_version=expected, principal=principal):
+                state._session_record = record  # type: ignore[attr-defined]
+                state._session_snapshot = dict(state.state_data)  # type: ignore[attr-defined]
+                return True
+            latest = store.resolve(session_hash, principal)
+            if latest is None:
+                return False
+            # Another turn wrote first: apply only this turn's changes on top.
+            merged = dict(latest.state_data)
+            merged.update(changed)
+            for key in deleted:
+                merged.pop(key, None)
+            state.state_data = merged
+            record = latest
+            expected = latest.version
+        return False
 
     def get_state_ids_to_track(
         self, block_fn: BlockFunction, state: SessionState | None

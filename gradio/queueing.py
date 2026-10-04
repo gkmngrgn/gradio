@@ -320,7 +320,7 @@ class Queue:
                 "queue_full",
             )
 
-        fn = route_utils.get_fn(self.blocks, None, body)
+        fn = route_utils.get_fn(self.blocks, None, body, principal=username)
         self.create_event_queue_for_fn(fn)
         if fn.validator is not None:
             gr_request = route_utils.compile_gr_request(
