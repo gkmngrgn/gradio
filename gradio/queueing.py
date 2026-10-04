@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import os
@@ -168,6 +169,11 @@ class Queue:
         # External durable queue for redelivery. None keeps the pure in-process
         # behavior; U12 wires it from configuration.
         self.job_queue = None
+        # Idempotency keys whose work has been applied, and the lease-renewal
+        # interval for a running durable job.
+        self._applied_job_keys: set[str] = set()
+        self.job_lease_renew_interval = 20.0
+        self._durable_task: asyncio.Task | None = None
         self.default_concurrency_limit = self._resolve_concurrency_limit(
             default_concurrency_limit
         )
@@ -526,6 +532,115 @@ class Queue:
             # The local copy still runs; a publish failure must not drop the
             # request that is already on the in-process queue.
             logger.exception("durable job publish failed")
+
+    def start_durable_consumer(self) -> None:
+        """Start the loop that runs jobs redelivered to this replica.
+
+        The consumer reads new jobs and reclaims jobs an earlier consumer left
+        pending past the lease, then runs each on this replica. No-op without an
+        external queue.
+        """
+        if self.job_queue is None or self._durable_task is not None:
+            return
+        self._durable_task = run_coro_in_background(self.consume_durable_jobs)
+
+    async def stop_durable_consumer(self) -> None:
+        if self._durable_task is not None:
+            self._durable_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._durable_task
+            self._durable_task = None
+
+    async def consume_durable_jobs(self) -> None:
+        queue = self.job_queue
+        if queue is None:
+            return
+        lease_ms = getattr(queue, "lease_ms", 60_000)
+        while not self.stopped:
+            try:
+                messages = queue.read(count=1, block_ms=1000)
+                if not messages:
+                    messages = queue.reclaim(min_idle_ms=lease_ms)
+                for message in messages:
+                    await self.run_durable_job(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("durable consumer loop error")
+                await asyncio.sleep(1.0)
+
+    async def run_durable_job(self, message) -> bool:
+        """Run one claimed job, then ack it only after the work is applied.
+
+        The queue's message id is the idempotency key: a redelivered job whose
+        work was already applied is acked without re-running, and the ack is
+        ordered after `process_events` returns (which is after the session save
+        inside `call_process_api`), so a crash between the two redelivers rather
+        than losing state.
+        """
+        queue = self.job_queue
+        if queue is None:
+            return False
+        job = message.job
+        key = job.idempotency_key
+        if key in self._applied_job_keys:
+            queue.ack(message.id)
+            return False
+
+        blocks = self.blocks
+        fn = blocks.fns.get(job.fn_index)
+        if fn is None:
+            # The function is not in this app's config; leave it for a replica
+            # that has it.
+            return False
+
+        self.create_event_queue_for_fn(fn)
+        # A redelivered job has no client request; synthesize one from the
+        # app's own local URL so processing has a request to compile against.
+        request = _starlette_request_from_local_url(blocks)
+        event = Event(
+            job.session_hash,
+            fn,
+            request=request,  # type: ignore[arg-type]
+            username=job.principal,
+        )
+        body = PredictBodyInternal(
+            data=job.inputs,
+            fn_index=job.fn_index,
+            session_hash=job.session_hash,
+            batched=bool(job.batch),
+            request=request,  # type: ignore[arg-type]
+        )
+        body.event_id = event._id
+        event.data = body
+        self.event_ids_to_events[event._id] = event
+        # A redelivered job has no live client channel; buffered messages are
+        # dropped when the run finishes.
+        self.pending_messages_per_session.setdefault(event.session_hash, AsyncQueue())
+
+        renewer = asyncio.create_task(self._renew_lease(queue, message.id))
+        try:
+            await self.process_events([event], bool(job.batch), time.time(), fn)
+        finally:
+            renewer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renewer
+            self.event_ids_to_events.pop(event._id, None)
+
+        # Work is applied (or terminally failed); record the key so a
+        # redelivery does not re-run it, then ack.
+        self._applied_job_keys.add(key)
+        queue.ack(message.id)
+        return True
+
+    async def _renew_lease(self, queue, message_id: str) -> None:
+        """Keep a running job's lease alive so a healthy replica is not preempted."""
+        while True:
+            await asyncio.sleep(self.job_lease_renew_interval)
+            try:
+                queue.renew(message_id)
+            except Exception:
+                logger.debug("durable job lease renew failed", exc_info=True)
 
     async def remove_from_queue(self, event_id: str):
         event = self.event_ids_to_events.get(event_id)
@@ -1197,6 +1312,31 @@ class Queue:
                 pass
             del app.iterators[event_id]
         return
+
+
+def _starlette_request_from_local_url(blocks: Blocks) -> fastapi.Request:
+    """A minimal request for a job that has no client connection (redelivery).
+
+    Uses the app's own local URL so route/root-path derivation works; there is
+    no client to receive messages, which `run_durable_job` accounts for.
+    """
+    from starlette.requests import Request as StarletteRequest
+
+    path = f"{route_utils.API_PREFIX}/queue/join"
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"localhost")],
+        "server": ("localhost", 0),
+        "client": ("localhost", 0),
+    }
+    return StarletteRequest(scope, receive=lambda: None)  # type: ignore[arg-type]
 
 
 def create_validator_fn(fn: BlockFunction) -> BlockFunction:

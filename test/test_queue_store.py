@@ -150,6 +150,91 @@ class TestDispatchWiring:
         assert job.fn_index == fn._id
 
 
+class TestRedeliveryConsumer:
+    """U9c: a survivor reconstructs and runs a claimed job, save-before-ack."""
+
+    @staticmethod
+    def _app():
+        import gradio as gr
+
+        with gr.Blocks() as demo:
+            seen = gr.State(0)
+            out = gr.Number()
+            gr.Button().click(lambda s: (s + 1, s + 1), [seen], [out, seen])
+        return demo
+
+    def test_run_durable_job_applies_state_then_acks(self, redis_client):
+        from gradio.queue_store import JobEnvelope
+
+        demo = self._app()
+        demo.launch(prevent_thread_lock=True)
+        try:
+            queue = demo._queue
+            queue.job_queue = _queue(redis_client, "survivor")
+            fn = demo.fns[0]
+            producer = _queue(redis_client, "producer")
+            producer.publish(
+                JobEnvelope(fn_index=fn._id, inputs=[None], session_hash="s1")
+            )
+            (claimed,) = _queue(redis_client, "survivor").read(block_ms=10)
+
+            assert asyncio.run(queue.run_durable_job(claimed)) is True
+
+            # Acked only after the work applied it.
+            assert len(queue.job_queue) == 0
+            stored = demo.get_session_state("s1", create=False)
+            assert stored is not None
+            assert stored.state_data[fn.inputs[0]._id] == 1
+        finally:
+            demo.close()
+
+    def test_redelivered_job_is_deduped_by_idempotency_key(self, redis_client):
+        from gradio.queue_store import JobEnvelope
+
+        demo = self._app()
+        demo.launch(prevent_thread_lock=True)
+        try:
+            queue = demo._queue
+            queue.job_queue = _queue(redis_client, "survivor")
+            fn = demo.fns[0]
+            producer = _queue(redis_client, "producer")
+            producer.publish(
+                JobEnvelope(
+                    fn_index=fn._id,
+                    inputs=[None],
+                    session_hash="s1",
+                    idempotency_key="event-1",
+                )
+            )
+            (claimed,) = _queue(redis_client, "survivor").read(block_ms=10)
+
+            assert asyncio.run(queue.run_durable_job(claimed)) is True
+            # The same job redelivered (same key) is acked without re-running, so
+            # state is applied once.
+            assert asyncio.run(queue.run_durable_job(claimed)) is False
+            assert "event-1" in queue._applied_job_keys
+            stored = demo.get_session_state("s1", create=False)
+            assert stored.state_data[fn.inputs[0]._id] == 1
+        finally:
+            demo.close()
+
+    def test_unknown_function_is_left_for_a_replica_that_has_it(self, redis_client):
+        from gradio.queue_store import JobEnvelope
+
+        demo = self._app()
+        demo.launch(prevent_thread_lock=True)
+        try:
+            queue = demo._queue
+            queue.job_queue = _queue(redis_client, "survivor")
+            producer = _queue(redis_client, "producer")
+            producer.publish(JobEnvelope(fn_index=9999, inputs=[], session_hash="s1"))
+            (claimed,) = _queue(redis_client, "survivor").read(block_ms=10)
+
+            assert asyncio.run(queue.run_durable_job(claimed)) is False
+        finally:
+            demo.close()
+
+
 @pytest.mark.integration
 def test_redelivery_against_real_redis(real_redis_client):
     """Tier B: the same reclaim/ack contract on a real server."""
