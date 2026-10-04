@@ -68,6 +68,9 @@ class FileStore(Protocol):
     def delete(self, key: str) -> None:
         """Remove a stored file."""
 
+    def list_records(self) -> list[FileRecord]:
+        """Every stored file with its ownership metadata, for orphan GC."""
+
 
 def _record(
     key: str, local_path: str, owner: str | None, session_hash: str | None
@@ -119,6 +122,10 @@ class LocalFileStore:
     def delete(self, key):
         with self._lock:
             self._records.pop(key, None)
+
+    def list_records(self) -> list[FileRecord]:
+        with self._lock:
+            return list(self._records.values())
 
 
 class HfBucketFileStore:
@@ -220,6 +227,37 @@ class HfBucketFileStore:
             bucket_id=self.bucket,
             delete=[self._object_key(key), self._owner_key(key)],
         )
+
+    def _owner_prefix(self) -> str:
+        return f"{self.prefix}/owners/{self.app_id}/"
+
+    def list_records(self) -> list[FileRecord]:
+        prefix = self._owner_prefix()
+        records = []
+        for entry in self._api().list_bucket_tree(
+            self.bucket, prefix=prefix, recursive=True
+        ):
+            if getattr(entry, "type", None) != "file" or not entry.path.endswith(
+                ".json"
+            ):
+                continue
+            key = entry.path[len(prefix) : -len(".json")]
+            try:
+                owner = self._owner_record(key)
+            except Exception:
+                continue
+            if owner is None:
+                continue
+            records.append(
+                FileRecord(
+                    key=key,
+                    owner=owner.get("owner"),
+                    session_hash=owner.get("session_hash"),
+                    committed_at=owner.get("committed_at", 0.0),
+                    size=owner.get("size", 0),
+                )
+            )
+        return records
 
 
 def resolve_file_store(

@@ -1188,8 +1188,31 @@ async def _delete_state(app: App):
     """Delete all expired state every second."""
     while True:
         blocks = app.get_blocks()
-        (blocks.session_store or blocks.state_holder).delete_all_expired_state()
+        if blocks.session_store is not None:
+            # The external store owns its lifecycle: sweep closed sessions past
+            # retention, then collect files orphaned by them.
+            removed = blocks.sweep_sessions()
+            if removed:
+                _collect_orphaned_files(blocks)
+        else:
+            blocks.state_holder.delete_all_expired_state()
         await asyncio.sleep(1)
+
+
+def _collect_orphaned_files(blocks: Blocks) -> None:
+    """Delete stored files whose owning session no longer exists."""
+    store = blocks.file_store
+    session_store = blocks.session_store
+    if store is None or session_store is None:
+        return
+    list_keys = getattr(store, "list_records", None)
+    if list_keys is None:
+        return
+    for record in list_keys():
+        if record.session_hash is None:
+            continue
+        if session_store.resolve(record.session_hash, record.owner) is None:
+            store.delete(record.key)
 
 
 @asynccontextmanager

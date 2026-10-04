@@ -2987,6 +2987,37 @@ Received inputs:
             return None
         return store.materialize(key, principal)
 
+    def sweep_sessions(self, closed_retention: float = 3600.0) -> int:
+        """Remove closed sessions past retention and clean up their state.
+
+        Runs each removed session's component ``delete_callback`` and returns
+        the number removed. The in-process path keeps the ``StateHolder``
+        behavior unchanged (``delete_all_expired_state`` handles it).
+        """
+        store = self.session_store
+        if store is None:
+            return 0
+        removed = store.sweep(closed_retention=closed_retention)
+        from gradio.components import State
+
+        for record in removed:
+            # Only gr.State values carry a delete_callback; component config is
+            # rebuilt per replica and is not cleaned up here.
+            for key, value in record.state_data.items():
+                component = self.default_config.blocks.get(key)
+                if not isinstance(component, State):
+                    continue
+                try:
+                    component.delete_callback(value)
+                except Exception:
+                    # Cleanup must not stop the sweep for the other sessions.
+                    warnings.warn(
+                        f"session sweep delete_callback failed for "
+                        f"{record.session_hash}",
+                        stacklevel=2,
+                    )
+        return len(removed)
+
     def get_state_ids_to_track(
         self, block_fn: BlockFunction, state: SessionState | None
     ) -> tuple[list[int], list]:
