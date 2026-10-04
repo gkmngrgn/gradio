@@ -169,7 +169,10 @@ class InProcessSessionStore:
     ) -> SessionRecord:
         if not self.contains(session_hash, principal):
             return self.create(session_hash, principal)
-        return self.resolve(session_hash, principal)  # type: ignore[return-value]
+        record = self.resolve(session_hash, principal)
+        if record is None:  # pragma: no cover - contains() just proved it exists
+            return self.create(session_hash, principal)
+        return record
 
     def create(self, session_hash: str, principal: str | None = None) -> SessionRecord:
         # Use the holder's own creation path so defaults match exactly.
@@ -284,7 +287,7 @@ def resolve_session_store(
     blocks: Blocks | None = None,
     holder: StateHolder | None = None,
     **backend_kwargs: Any,
-) -> InProcessSessionStore:
+) -> SessionStore:
     """Resolve the configured store.
 
     Precedence, mirroring the repo's adapter convention: an explicit argument,
@@ -304,7 +307,7 @@ def resolve_session_store(
                 "The Redis session store needs a client. Pass `client=` or set "
                 "GRADIO_REDIS_URL so it can be created."
             )
-        return RedisSessionStore(client, **backend_kwargs)  # type: ignore[return-value]
+        return RedisSessionStore(client, **backend_kwargs)
 
     store_cls = _BUILTIN_STORES.get(name)
     if store_cls is None:

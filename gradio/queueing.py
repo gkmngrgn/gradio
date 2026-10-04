@@ -1336,7 +1336,11 @@ def _starlette_request_from_local_url(blocks: Blocks) -> fastapi.Request:
         "server": ("localhost", 0),
         "client": ("localhost", 0),
     }
-    return StarletteRequest(scope, receive=lambda: None)  # type: ignore[arg-type]
+
+    async def receive() -> dict:
+        return {"type": "http.request"}
+
+    return StarletteRequest(scope, receive=receive)  # type: ignore[arg-type]
 
 
 def create_validator_fn(fn: BlockFunction) -> BlockFunction:

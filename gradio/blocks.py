@@ -2871,8 +2871,8 @@ Received inputs:
         state = SessionState(self)
         state.state_data.update(record.state_data)
         state.is_closed = record.is_closed
-        state._session_record = record  # type: ignore[attr-defined]
-        state._session_snapshot = dict(record.state_data)  # type: ignore[attr-defined]
+        state._session_record = record
+        state._session_snapshot = dict(record.state_data)
         return state
 
     def save_session_state(
@@ -2926,8 +2926,8 @@ Received inputs:
                     state, session_hash, principal, err
                 ) from err
             if saved:
-                state._session_record = record  # type: ignore[attr-defined]
-                state._session_snapshot = dict(state.state_data)  # type: ignore[attr-defined]
+                state._session_record = record
+                state._session_snapshot = dict(state.state_data)
                 return True
             latest = store.resolve(session_hash, principal)
             if latest is None:
@@ -2985,9 +2985,9 @@ Received inputs:
         from gradio.session_store import resolve_session_store
 
         env_config = os.getenv("GRADIO_MULTI_REPLICA")
-        if config is None and not env_config:
-            return
         if config is None:
+            if not env_config:
+                return
             # The environment variable carries the configuration as JSON, so a
             # deploy can opt in without changing app code.
             try:
@@ -3010,7 +3010,7 @@ Received inputs:
                     f"multi_replica: no URL for {what}. Supply it in the launch "
                     f"configuration or the matching GRADIO_* environment variable."
                 )
-            import redis
+            import redis  # ty: ignore[unresolved-import]
 
             return redis.Redis.from_url(url, decode_responses=False)
 
