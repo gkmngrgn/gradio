@@ -9,6 +9,7 @@ an idle consumer, and acking removes it from the pending list.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import fakeredis
 import pytest
@@ -56,10 +57,11 @@ class TestRedisJobQueue:
         worker = _queue(redis_client, "w")
         message_id = producer.publish(JobEnvelope(fn_index=1, inputs=["x"]))
 
-        messages = worker.read(block_ms=10)
+        messages = producer.reclaim(min_idle_ms=0)
         assert [m.id for m in messages] == [message_id]
         assert messages[0].job.inputs == ["x"]
-        # A second read sees nothing new until the job is acked and redelivered.
+        # The published job is already pending under its producer; new-job
+        # reads are reserved for the producer path, not survivor consumers.
         assert worker.read(block_ms=10) == []
         assert len(worker) == 1
 
@@ -68,7 +70,7 @@ class TestRedisJobQueue:
         worker = _queue(redis_client, "w")
         producer.publish(JobEnvelope(fn_index=1, inputs=[], session_hash="s"))
 
-        (claimed,) = worker.read(block_ms=10)
+        (claimed,) = producer.reclaim(min_idle_ms=0)
 
         # Another replica reclaims work the first consumer left pending.
         survivor = _queue(redis_client, "w2")
@@ -80,7 +82,7 @@ class TestRedisJobQueue:
         producer = _queue(redis_client, "p")
         worker = _queue(redis_client, "w")
         producer.publish(JobEnvelope(fn_index=1, inputs=[]))
-        (claimed,) = worker.read(block_ms=10)
+        (claimed,) = producer.reclaim(min_idle_ms=0)
 
         worker.ack(claimed.id)
         assert len(worker) == 0
@@ -90,7 +92,7 @@ class TestRedisJobQueue:
         producer = _queue(redis_client, "p")
         worker = _queue(redis_client, "w")
         producer.publish(JobEnvelope(fn_index=1, inputs=[]))
-        (claimed,) = worker.read(block_ms=10)
+        (claimed,) = producer.reclaim(min_idle_ms=0)
 
         worker.renew(claimed.id)
         # The entry is still pending for this consumer (not lost, not acked).
@@ -141,12 +143,46 @@ class TestDispatchWiring:
         ok, _event_id, status = asyncio.run(queue.push(body, request, username="alice"))
         assert ok is True and status == "success"
 
-        messages = _queue(redis_client, "reader").read(block_ms=10)
+        messages = queue.job_queue.reclaim(min_idle_ms=0)
         assert len(messages) == 1
         job = messages[0].job
         assert job.session_hash == "s1"
         assert job.principal == "alice"
         assert job.fn_index == fn._id
+
+    def test_local_execution_acks_its_durable_copy_once(self, redis_client):
+        import gradio as gr
+        from fastapi.testclient import TestClient
+
+        calls = []
+        with gr.Blocks() as demo:
+            state = gr.State(0)
+
+            def increment(value):
+                calls.append(value)
+                return value + 1
+
+            gr.Button().click(increment, [state], [state])
+        from gradio.routes import App
+
+        app = App.create_app(demo)
+        queue = demo._queue
+        queue.job_queue = _queue(redis_client, "producer")
+        with TestClient(app) as client:
+            client.get("/gradio_api/startup-events")
+            response = client.post(
+                "/gradio_api/queue/join",
+                json={"data": [0], "fn_index": 0, "session_hash": "s1"},
+            )
+            assert response.status_code == 200
+            for _ in range(100):
+                if calls and len(queue.job_queue) == 0:
+                    break
+                time.sleep(0.02)
+
+        assert calls == [0]
+        assert len(queue.job_queue) == 0
+        assert len(queue._applied_job_keys) == 1
 
 
 class TestRedeliveryConsumer:
@@ -175,7 +211,7 @@ class TestRedeliveryConsumer:
             producer.publish(
                 JobEnvelope(fn_index=fn._id, inputs=[None], session_hash="s1")
             )
-            (claimed,) = _queue(redis_client, "survivor").read(block_ms=10)
+            (claimed,) = producer.reclaim(min_idle_ms=0)
 
             assert asyncio.run(queue.run_durable_job(claimed)) is True
 
@@ -205,7 +241,7 @@ class TestRedeliveryConsumer:
                     idempotency_key="event-1",
                 )
             )
-            (claimed,) = _queue(redis_client, "survivor").read(block_ms=10)
+            (claimed,) = producer.reclaim(min_idle_ms=0)
 
             assert asyncio.run(queue.run_durable_job(claimed)) is True
             # The same job redelivered (same key) is acked without re-running, so
@@ -227,7 +263,7 @@ class TestRedeliveryConsumer:
             queue.job_queue = _queue(redis_client, "survivor")
             producer = _queue(redis_client, "producer")
             producer.publish(JobEnvelope(fn_index=9999, inputs=[], session_hash="s1"))
-            (claimed,) = _queue(redis_client, "survivor").read(block_ms=10)
+            (claimed,) = producer.reclaim(min_idle_ms=0)
 
             assert asyncio.run(queue.run_durable_job(claimed)) is False
         finally:
@@ -240,7 +276,7 @@ def test_redelivery_against_real_redis(real_redis_client):
     producer = RedisJobQueue(real_redis_client, stream="it:jobs", group="g")
     worker = RedisJobQueue(real_redis_client, stream="it:jobs", group="g")
     producer.publish(JobEnvelope(fn_index=1, inputs=[], session_hash="s"))
-    (claimed,) = worker.read(block_ms=10)
+    (claimed,) = producer.reclaim(min_idle_ms=0)
 
     survivor = RedisJobQueue(real_redis_client, stream="it:jobs", group="g")
     reclaimed = survivor.reclaim(min_idle_ms=0)

@@ -179,7 +179,20 @@ class RedisJobQueue:
         message_id = self._client.xadd(
             self._key(self.stream), {JOB_FIELD: encode_job(job)}
         )
-        return message_id.decode() if isinstance(message_id, bytes) else message_id
+        message_id = (
+            message_id.decode() if isinstance(message_id, bytes) else message_id
+        )
+        # The in-process queue executes the first attempt so it can stream to
+        # the submitting client. Put the durable copy in the pending list now;
+        # other replicas only reclaim it after this producer's lease expires.
+        self._client.xreadgroup(
+            self.group,
+            self.consumer,
+            {self._key(self.stream): ">"},
+            count=1,
+            block=0,
+        )
+        return message_id
 
     def read(self, count: int = 1, block_ms: int | None = None) -> list[JobMessage]:
         streams = {self._key(self.stream): ">"}

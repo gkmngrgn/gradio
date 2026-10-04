@@ -172,6 +172,12 @@ class Queue:
         # Idempotency keys whose work has been applied, and the lease-renewal
         # interval for a running durable job.
         self._applied_job_keys: set[str] = set()
+        # Keys this process published and is running locally. The durable
+        # consumer skips these, so a job is not executed twice on the replica
+        # that queued it (see run_durable_job).
+        self._local_job_keys: set[str] = set()
+        self._local_job_messages: dict[str, str] = {}
+        self._local_job_renewers: dict[str, asyncio.Task] = {}
         self.job_lease_renew_interval = 20.0
         self._durable_task: asyncio.Task | None = None
         self.default_concurrency_limit = self._resolve_concurrency_limit(
@@ -526,11 +532,20 @@ class Queue:
             event_id=event._id,
             idempotency_key=event._id,
         )
+        # Mark the key before publishing so the consumer can never claim and run
+        # this replica's own copy.
+        self._local_job_keys.add(job.idempotency_key)
         try:
-            queue.publish(job)
+            message_id = queue.publish(job)
+            self._local_job_messages[job.idempotency_key] = message_id
+            self._local_job_renewers[job.idempotency_key] = run_coro_in_background(
+                self._renew_lease, queue, message_id
+            )
         except Exception:
             # The local copy still runs; a publish failure must not drop the
             # request that is already on the in-process queue.
+            self._local_job_keys.discard(job.idempotency_key)
+            self._local_job_messages.pop(job.idempotency_key, None)
             logger.exception("durable job publish failed")
 
     def start_durable_consumer(self) -> None:
@@ -558,11 +573,14 @@ class Queue:
         lease_ms = getattr(queue, "lease_ms", 60_000)
         while not self.stopped:
             try:
-                messages = queue.read(count=1, block_ms=1000)
-                if not messages:
-                    messages = queue.reclaim(min_idle_ms=lease_ms)
+                # New jobs run in the local queue so the submitting client can
+                # receive its stream. This worker only takes over jobs whose
+                # producer lease expired. Redis I/O stays off the event loop.
+                messages = await asyncio.to_thread(queue.reclaim, min_idle_ms=lease_ms)
                 for message in messages:
                     await self.run_durable_job(message)
+                if not messages:
+                    await asyncio.sleep(1)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -585,6 +603,12 @@ class Queue:
         key = job.idempotency_key
         if key in self._applied_job_keys:
             queue.ack(message.id)
+            return False
+        if key in self._local_job_keys:
+            # This replica queued and is running the job locally. Leave the
+            # entry pending: if the local run never finishes, the lease expires
+            # and a survivor reclaims it; if it finishes, the key moves to
+            # _applied_job_keys and a later claim acks it.
             return False
 
         blocks = self.blocks
@@ -1294,6 +1318,22 @@ class Queue:
                     self.compute_analytics_summary,
                     list(self.event_analytics.values()),
                 )
+
+                message_id = self._local_job_messages.pop(event._id, None)
+                if message_id is not None:
+                    self._local_job_keys.discard(event._id)
+                    renewer = self._local_job_renewers.pop(event._id, None)
+                    if renewer is not None:
+                        renewer.cancel()
+                        await asyncio.gather(renewer, return_exceptions=True)
+                    if success:
+                        # process_events returns after call_process_api saves
+                        # session state, so ack only after the durable write.
+                        self._applied_job_keys.add(event._id)
+                        try:
+                            await asyncio.to_thread(self.job_queue.ack, message_id)
+                        except Exception:
+                            logger.exception("durable job ack failed after local run")
 
                 self.event_ids_to_events.pop(event._id, None)
 
