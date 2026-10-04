@@ -16,6 +16,7 @@ import secrets
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import unicodedata
 import uuid
@@ -1199,17 +1200,24 @@ async def _delete_state(app: App):
         await asyncio.sleep(1)
 
 
-def _collect_orphaned_files(blocks: Blocks) -> None:
-    """Delete stored files whose owning session no longer exists."""
+# A file whose session is absent is only collected after this grace window, so
+# an upload committed before its session record exists is not deleted at once.
+FILE_GC_GRACE_SECONDS = 3600.0
+
+
+def _collect_orphaned_files(
+    blocks: Blocks, grace_seconds: float = FILE_GC_GRACE_SECONDS
+) -> None:
+    """Delete stored files whose owning session is gone past a grace window."""
     store = blocks.file_store
     session_store = blocks.session_store
     if store is None or session_store is None:
         return
-    list_keys = getattr(store, "list_records", None)
-    if list_keys is None:
-        return
-    for record in list_keys():
+    now = time.time()
+    for record in store.list_records():
         if record.session_hash is None:
+            continue
+        if now - record.committed_at < grace_seconds:
             continue
         if session_store.resolve(record.session_hash, record.owner) is None:
             store.delete(record.key)

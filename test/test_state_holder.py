@@ -140,8 +140,13 @@ class TestOrphanedFileCollection:
 
         from gradio.route_utils import _collect_orphaned_files
 
+        # A fresh upload may precede creation of its session record; keep it
+        # during the grace period.
         _collect_orphaned_files(demo)
+        assert demo.file_store.resolve("sha/u.txt", None) is not None
+
         # The session never existed, so the file is orphaned and removed.
+        _collect_orphaned_files(demo, grace_seconds=0)
         assert demo.file_store.resolve("sha/u.txt", None) is None
         assert hub.files == {}
 
