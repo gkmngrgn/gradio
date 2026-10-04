@@ -98,14 +98,11 @@ class SessionStore(Protocol):
     def delete(self, session_hash: str, principal: str | None = None) -> None:
         """Remove a session."""
 
-    def sweep(
-        self, closed_retention: float = 3600.0, session_ttl: float | None = None
-    ) -> list[SessionRecord]:
-        """Remove closed sessions past their retention, or all past the TTL.
+    def sweep(self, closed_retention: float = 3600.0) -> list[SessionRecord]:
+        """Remove closed sessions past their retention.
 
         Returns the records that were removed, so the caller can run each
-        component's ``delete_callback``. ``session_ttl`` bounds an open
-        session's lifetime (``None`` keeps the current unbounded behavior).
+        component's ``delete_callback``.
         """
 
     def __len__(self) -> int:
@@ -130,7 +127,6 @@ class InProcessSessionStore:
         self._versions: dict[str, int] = {}
         self._fencing: dict[str, int] = {}
         self._closed_at: dict[str, float] = {}
-        self._created_at: dict[str, float] = {}
 
     @classmethod
     def from_holder(cls, holder: StateHolder) -> InProcessSessionStore:
@@ -179,7 +175,6 @@ class InProcessSessionStore:
         self._holder[session_hash]
         self._principals[session_hash] = principal
         self._versions[session_hash] = 0
-        self._created_at[session_hash] = time.time()
         self._closed_at.pop(session_hash, None)
         return self._to_record(session_hash, principal)
 
@@ -231,30 +226,20 @@ class InProcessSessionStore:
         self._versions.pop(session_hash, None)
         self._fencing.pop(session_hash, None)
         self._closed_at.pop(session_hash, None)
-        self._created_at.pop(session_hash, None)
 
-    def sweep(
-        self, closed_retention: float = 3600.0, session_ttl: float | None = None
-    ) -> list[SessionRecord]:
+    def sweep(self, closed_retention: float = 3600.0) -> list[SessionRecord]:
         now = time.time()
         doomed: list[str] = []
         for session_hash in list(self._holder.session_data):
             closed_at = self._closed_at.get(session_hash)
             if closed_at is not None and now - closed_at > closed_retention:
                 doomed.append(session_hash)
-            elif session_ttl is not None:
-                created_at = self._created_at.get(session_hash, now)
-                if now - created_at > session_ttl:
-                    doomed.append(session_hash)
         removed = []
         for session_hash in doomed:
             record = self._to_record(session_hash, self._principals.get(session_hash))
             self.delete(session_hash)
             removed.append(record)
         return removed
-
-    def delete_all_expired_state(self) -> None:
-        self._holder.delete_all_expired_state()
 
     def _to_record(self, session_hash: str, principal: str | None) -> SessionRecord:
         state = self._holder.session_data[session_hash]
@@ -319,11 +304,6 @@ def resolve_session_store(
     if blocks is not None:
         return store_cls(blocks=blocks)  # type: ignore[call-arg]
     return store_cls()  # type: ignore[call-arg]
-
-
-def register_session_store(name: str, store_cls: type) -> None:
-    """Register an external backend under a name, for ``GRADIO_SESSION_STORE``."""
-    _BUILTIN_STORES[name.strip().lower()] = store_cls
 
 
 # ---------------------------------------------------------------------------
@@ -640,9 +620,7 @@ class RedisSessionStore:
             return
         self._client.delete(self._key(session_hash))
 
-    def sweep(
-        self, closed_retention: float = 3600.0, session_ttl: float | None = None
-    ) -> list[SessionRecord]:
+    def sweep(self, closed_retention: float = 3600.0) -> list[SessionRecord]:
         now = time.time()
         removed = []
         for raw_key in self._client.scan_iter(match=self._match_pattern()):
@@ -653,24 +631,14 @@ class RedisSessionStore:
                 record, _ = decode_envelope(self._open(raw))
             except SessionEnvelopeError:
                 continue
-            age = None
-            if record.is_closed and record.closed_at:
-                age = now - record.closed_at
-                if age > closed_retention:
-                    self._client.delete(raw_key)
-                    removed.append(record)
-                    continue
-            if session_ttl is not None:
-                ttl = self._client.ttl(raw_key)
-                # -1: no expiry set, -2: missing. Only act when a positive TTL
-                # has elapsed; Redis's own expiry handles the rest.
-                if ttl == -1 and record.closed_at == 0.0:
-                    self._client.expire(raw_key, int(session_ttl))
+            if (
+                record.is_closed
+                and record.closed_at
+                and now - record.closed_at > closed_retention
+            ):
+                self._client.delete(raw_key)
+                removed.append(record)
         return removed
-
-    def delete_all_expired_state(self) -> None:
-        # Expiry is Redis's own TTL; nothing to sweep here.
-        return None
 
     def _touch(self, session_hash: str) -> None:
         if self.ttl_seconds:

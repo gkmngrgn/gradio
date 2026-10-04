@@ -41,7 +41,6 @@ class TestEnvelope:
             batch=True,
             event_id="e1",
             idempotency_key="key-1",
-            fencing_token=7,
         )
         restored = decode_job(encode_job(job))
         assert restored.to_dict() == job.to_dict()

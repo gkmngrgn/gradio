@@ -275,6 +275,6 @@ def resolve_file_store(
     back to the default rather than failing.
     """
     name = (spec or os.getenv(FILE_STORE_ENV_VAR) or "inprocess").strip().lower()
-    if name in ("hf", "hf-bucket", "hub", "bucket", "s3"):
+    if name in ("hf", "hf-bucket", "hub", "bucket"):
         return HfBucketFileStore(**backend_kwargs)
     return LocalFileStore()

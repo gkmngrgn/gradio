@@ -47,10 +47,6 @@ class JobEnvelope:
     # Stable across redeliveries, so a redelivered job can detect an already
     # applied write.
     idempotency_key: str = field(default_factory=lambda: secrets.token_urlsafe(16))
-    # Set by the queue when a worker claims the job; a late write with a stale
-    # token must be rejected.
-    fencing_token: int = 0
-    attempt: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,8 +57,6 @@ class JobEnvelope:
             "batch": self.batch,
             "event_id": self.event_id,
             "idempotency_key": self.idempotency_key,
-            "fencing_token": self.fencing_token,
-            "attempt": self.attempt,
         }
 
     @classmethod
@@ -75,8 +69,6 @@ class JobEnvelope:
             batch=data.get("batch"),
             event_id=data.get("event_id"),
             idempotency_key=data.get("idempotency_key") or secrets.token_urlsafe(16),
-            fencing_token=int(data.get("fencing_token", 0)),
-            attempt=int(data.get("attempt", 0)),
         )
 
 
