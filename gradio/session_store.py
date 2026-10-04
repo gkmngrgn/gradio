@@ -50,6 +50,9 @@ class SessionRecord:
     state_data: dict[int, Any] = field(default_factory=dict)
     is_closed: bool = False
     version: int = 0
+    # Highest fencing token that has written this session. A write carrying a
+    # lower token is a superseded worker's late write and is rejected.
+    fencing_token: int = 0
 
     @property
     def owner(self) -> str | None:
@@ -81,10 +84,12 @@ class SessionStore(Protocol):
         record: SessionRecord,
         expected_version: int,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         """Persist ``record`` if its stored version still equals
-        ``expected_version``. Returns ``False`` on a version mismatch or an
-        ownership mismatch, so the caller can retry."""
+        ``expected_version``. Returns ``False`` on a version mismatch, an
+        ownership mismatch, or a stale ``fencing_token``, so the caller can
+        retry."""
 
     def delete(self, session_hash: str, principal: str | None = None) -> None:
         """Remove a session."""
@@ -112,6 +117,7 @@ class InProcessSessionStore:
             self._holder.set_blocks(blocks)
         self._principals: dict[str, str | None] = {}
         self._versions: dict[str, int] = {}
+        self._fencing: dict[str, int] = {}
 
     @classmethod
     def from_holder(cls, holder: StateHolder) -> InProcessSessionStore:
@@ -164,6 +170,7 @@ class InProcessSessionStore:
         record: SessionRecord,
         expected_version: int,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         if not self._owns(record.session_hash, principal):
             return False
@@ -174,10 +181,20 @@ class InProcessSessionStore:
         # only when the caller's expectation matches what the store holds.
         if self._versions.get(record.session_hash, 0) != expected_version:
             return False
+        # Same for the fencing token: a write carrying a stale one is a
+        # superseded worker's late write. None skips the check (default path).
+        if (
+            fencing_token is not None
+            and self._fencing.get(record.session_hash, 0) > fencing_token
+        ):
+            return False
         state.state_data.clear()
         state.state_data.update(record.state_data)
         state.is_closed = record.is_closed
         self._versions[record.session_hash] = expected_version + 1
+        if fencing_token is not None:
+            self._fencing[record.session_hash] = fencing_token
+            record.fencing_token = fencing_token
         record.version = expected_version + 1
         return True
 
@@ -189,6 +206,7 @@ class InProcessSessionStore:
         self._holder.time_last_used.pop(session_hash, None)
         self._principals.pop(session_hash, None)
         self._versions.pop(session_hash, None)
+        self._fencing.pop(session_hash, None)
 
     def delete_all_expired_state(self) -> None:
         self._holder.delete_all_expired_state()
@@ -201,6 +219,7 @@ class InProcessSessionStore:
             state_data=dict(state.state_data),
             is_closed=state.is_closed,
             version=self._versions.get(session_hash, 0),
+            fencing_token=self._fencing.get(session_hash, 0),
         )
 
     def __len__(self) -> int:
@@ -374,6 +393,7 @@ def encode_envelope(record: SessionRecord, closed_at: str | None = None) -> byte
         "session_hash": record.session_hash,
         "principal": record.principal,
         "version": record.version,
+        "fencing_token": record.fencing_token,
         "is_closed": record.is_closed,
         "closed_at": closed_at,
         "state_data": {
@@ -407,6 +427,7 @@ def decode_envelope(raw: bytes) -> tuple[SessionRecord, str | None]:
         },
         is_closed=bool(payload.get("is_closed", False)),
         version=int(payload.get("version", 0)),
+        fencing_token=int(payload.get("fencing_token", 0)),
     )
     return record, payload.get("closed_at")
 
@@ -511,6 +532,7 @@ class RedisSessionStore:
         record: SessionRecord,
         expected_version: int,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         key = self._key(record.session_hash)
         with self._client.pipeline() as pipe:
@@ -527,6 +549,12 @@ class RedisSessionStore:
                 ):
                     pipe.unwatch()
                     return False
+                # A superseded worker's late write carries a stale token.
+                if fencing_token is not None and fencing_token < current.fencing_token:
+                    pipe.unwatch()
+                    return False
+                if fencing_token is not None:
+                    record.fencing_token = fencing_token
                 record.version = expected_version + 1
                 pipe.multi()
                 pipe.set(key, self._seal(encode_envelope(record)))

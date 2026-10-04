@@ -8,6 +8,8 @@ an idle consumer, and acking removes it from the pending list.
 
 from __future__ import annotations
 
+import asyncio
+
 import fakeredis
 import pytest
 
@@ -110,6 +112,42 @@ class TestResolution:
         monkeypatch.setenv("GRADIO_JOB_QUEUE", "redis")
         queue = resolve_job_queue(client=redis_client)
         assert isinstance(queue, RedisJobQueue)
+
+
+class TestDispatchWiring:
+    def test_default_queue_does_not_publish(self):
+        import gradio as gr
+
+        with gr.Blocks() as demo:
+            gr.Button()
+        assert demo._queue.job_queue is None
+        assert demo._queue.durable_jobs() is None
+
+    def test_push_publishes_a_job_with_the_caller_principal(self, redis_client):
+        import gradio as gr
+        from gradio.data_classes import PredictBodyInternal
+
+        with gr.Blocks() as demo:
+            state = gr.State(0)
+            btn = gr.Button()
+            btn.click(lambda s: s, [state], None)
+        queue = demo._queue
+        queue.job_queue = _queue(redis_client, "producer")
+        fn = demo.fns[0]
+
+        body = PredictBodyInternal(
+            data=[None], fn_index=fn._id, session_hash="s1", request=None
+        )
+        request = gr.Request(request=None)
+        ok, _event_id, status = asyncio.run(queue.push(body, request, username="alice"))
+        assert ok is True and status == "success"
+
+        messages = _queue(redis_client, "reader").read(block_ms=10)
+        assert len(messages) == 1
+        job = messages[0].job
+        assert job.session_hash == "s1"
+        assert job.principal == "alice"
+        assert job.fn_index == fn._id
 
 
 @pytest.mark.integration

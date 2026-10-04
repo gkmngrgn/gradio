@@ -2874,6 +2874,7 @@ Received inputs:
         state: SessionState,
         session_hash: str,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         """Persist a session through the configured store.
 
@@ -2909,7 +2910,10 @@ Received inputs:
             record.is_closed = state.is_closed
             try:
                 saved = store.save(
-                    record, expected_version=expected, principal=principal
+                    record,
+                    expected_version=expected,
+                    principal=principal,
+                    fencing_token=fencing_token,
                 )
             except SessionEnvelopeError as err:
                 raise self._session_envelope_error(

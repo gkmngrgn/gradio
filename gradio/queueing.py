@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import platform
 import random
@@ -51,6 +52,8 @@ from gradio.utils import (
 )
 
 from .block_function import BlockFunction
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from gradio.block_function import BlockFunction
@@ -162,6 +165,9 @@ class Queue:
         self.max_size = max_size
         self.blocks = blocks
         self._asyncio_tasks: set[asyncio.Task] = set()
+        # External durable queue for redelivery. None keeps the pure in-process
+        # behavior; U12 wires it from configuration.
+        self.job_queue = None
         self.default_concurrency_limit = self._resolve_concurrency_limit(
             default_concurrency_limit
         )
@@ -480,8 +486,46 @@ class Queue:
         while len(self.event_analytics) > self.ANALYTICS_MAX_EVENTS:
             self.event_analytics.pop(next(iter(self.event_analytics)))
 
+        # Durable path: also publish the job to the external queue so a job the
+        # replica does not finish can be redelivered to a survivor. The local
+        # copy still runs it; the idempotency key ties the two together.
+        self.publish_durable_job(event, fn, body, username)
         self.broadcast_estimations(event.concurrency_id, len(event_queue.queue) - 1)
         return True, event._id, "success"
+
+    def durable_jobs(self):
+        """The configured external job queue, or None for the in-process path."""
+        if self.job_queue is None:
+            return None
+        return self.job_queue
+
+    def publish_durable_job(self, event, fn, body, username) -> None:
+        """Publish a queued job for redelivery; no-op without an external queue.
+
+        The job's idempotency key is derived from the event so a redelivered
+        duplicate can be detected, and it is bound to the caller's principal so
+        a survivor resolves the session as the same owner.
+        """
+        from gradio.queue_store import JobEnvelope
+
+        queue = self.durable_jobs()
+        if queue is None:
+            return
+        job = JobEnvelope(
+            fn_index=fn._id,
+            inputs=body.data,
+            session_hash=body.session_hash,
+            principal=username,
+            batch=body.batched,
+            event_id=event._id,
+            idempotency_key=event._id,
+        )
+        try:
+            queue.publish(job)
+        except Exception:
+            # The local copy still runs; a publish failure must not drop the
+            # request that is already on the in-process queue.
+            logger.exception("durable job publish failed")
 
     async def remove_from_queue(self, event_id: str):
         event = self.event_ids_to_events.get(event_id)
