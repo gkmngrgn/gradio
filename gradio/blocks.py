@@ -82,7 +82,12 @@ from gradio.i18n import I18n, I18nData
 from gradio.node_server import start_node_server
 from gradio.route_utils import API_PREFIX, MediaStream, principal_from_request, slugify
 from gradio.routes import INTERNAL_ROUTES, VERSION, App, Request
-from gradio.session_store import SessionRecord, SessionStore
+from gradio.session_store import (
+    SessionEnvelopeError,
+    SessionRecord,
+    SessionStore,
+    encode_envelope,
+)
 from gradio.state_holder import SessionState, StateHolder
 from gradio.themes import ThemeClass as Theme
 from gradio.tunneling import (
@@ -2897,7 +2902,15 @@ Received inputs:
             record.principal = principal
             record.state_data = dict(state.state_data)
             record.is_closed = state.is_closed
-            if store.save(record, expected_version=expected, principal=principal):
+            try:
+                saved = store.save(
+                    record, expected_version=expected, principal=principal
+                )
+            except SessionEnvelopeError as err:
+                raise self._session_envelope_error(
+                    state, session_hash, principal, err
+                ) from err
+            if saved:
                 state._session_record = record  # type: ignore[attr-defined]
                 state._session_snapshot = dict(state.state_data)  # type: ignore[attr-defined]
                 return True
@@ -2913,6 +2926,36 @@ Received inputs:
             record = latest
             expected = latest.version
         return False
+
+    def _session_envelope_error(
+        self,
+        state: SessionState,
+        session_hash: str,
+        principal: str | None,
+        error: SessionEnvelopeError,
+    ) -> SessionEnvelopeError:
+        """Re-raise an envelope failure naming the state that holds the value.
+
+        The codec only sees component ids, so the readable name is added here,
+        where the session's own config is available. Request-scoped component
+        values do not participate: only ``state_data`` crosses the store.
+        """
+        for key, value in state.state_data.items():
+            try:
+                encode_envelope(
+                    SessionRecord(
+                        session_hash=session_hash,
+                        principal=principal,
+                        state_data={key: value},
+                    )
+                )
+            except SessionEnvelopeError:
+                return SessionEnvelopeError(
+                    f"The value of {state.label_for(key)} (type "
+                    f"{type(value).__name__}) cannot be stored by the configured "
+                    f"session store. {error}"
+                )
+        return error
 
     def get_state_ids_to_track(
         self, block_fn: BlockFunction, state: SessionState | None

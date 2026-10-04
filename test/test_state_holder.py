@@ -1,4 +1,8 @@
+import fakeredis
+import pytest
+
 import gradio as gr
+from gradio.session_store import RedisSessionStore, SessionEnvelopeError
 from gradio.state_holder import StateHolder
 
 
@@ -36,3 +40,66 @@ class TestStateHolderDoesNotAccumulate:
 
         assert len(holder.session_data) == 2
         assert set(holder.time_last_used) == set(holder.session_data)
+
+
+class _Opaque:
+    """A value the typed envelope cannot represent."""
+
+
+class TestSerializationFailure:
+    """R14: a value outside the envelope fails loudly and names its source."""
+
+    @staticmethod
+    def _demo():
+        with gr.Blocks() as demo:
+            state = gr.State(0)
+        return demo, state
+
+    @staticmethod
+    def _store():
+        return RedisSessionStore(
+            fakeredis.FakeRedis(decode_responses=False), app_id="app-1"
+        )
+
+    def test_label_for_names_the_state(self):
+        demo, state = self._demo()
+        session = _holder(demo)["s"]
+        assert session.label_for(state._id) == f"state (id {state._id})"
+
+    def test_supported_value_stores(self):
+        demo, state = self._demo()
+        demo.session_store = self._store()
+        session = demo.get_session_state("h")
+        session.state_data[state._id] = {"a": [1, 2, {"b": (3, 4)}]}
+
+        assert demo.save_session_state(session, "h") is True
+        stored = demo.session_store.resolve("h", None)
+        assert stored is not None
+        assert stored.state_data[state._id] == {"a": [1, 2, {"b": (3, 4)}]}
+
+    def test_unsupported_value_names_the_state_and_type(self):
+        demo, state = self._demo()
+        demo.session_store = self._store()
+        session = demo.get_session_state("h")
+        session.state_data[state._id] = _Opaque()
+
+        with pytest.raises(SessionEnvelopeError) as err:
+            demo.save_session_state(session, "h")
+        message = str(err.value)
+        assert f"state (id {state._id})" in message
+        assert "_Opaque" in message
+
+    def test_unsupported_value_does_not_stringify_or_fall_back(self):
+        demo, state = self._demo()
+        demo.session_store = self._store()
+        session = demo.get_session_state("h")
+        session.state_data[state._id] = "kept"
+        assert demo.save_session_state(session, "h") is True
+
+        session.state_data[state._id] = _Opaque()
+        with pytest.raises(SessionEnvelopeError):
+            demo.save_session_state(session, "h")
+
+        stored = demo.session_store.resolve("h", None)
+        assert stored is not None
+        assert stored.state_data[state._id] == "kept"
