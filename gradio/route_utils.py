@@ -1548,6 +1548,15 @@ def file_fetch(
     if not allowed:
         raise HTTPException(403, f"File not allowed: {path_or_url}.")
 
+    return serve_path(abs_path, request, reason)
+
+
+def serve_path(abs_path, request, reason):
+    """Serve a validated local path, with range support and safe MIME typing.
+
+    Shared by the local path and by a file an external store has already
+    ownership-checked and materialized.
+    """
     mime_type, _ = mimetypes.guess_type(abs_path)
     if mime_type in XSS_SAFE_MIMETYPES or reason == "allowed":
         media_type = mime_type or "application/octet-stream"
@@ -1582,6 +1591,11 @@ def file_fetch(
         media_type=media_type,
         filename=abs_path.name,
     )
+
+
+def upload_store_key(path_or_url: str, upload_dir: str) -> str:
+    """The store key for a file: its path relative to the upload directory."""
+    return os.path.relpath(utils.abspath(path_or_url), utils.abspath(upload_dir))
 
 
 async def upload_fn(

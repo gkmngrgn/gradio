@@ -1402,10 +1402,24 @@ class App(FastAPI):
 
         @router.head("/file={path_or_url:path}", dependencies=[Depends(login_check)])
         @router.get("/file={path_or_url:path}", dependencies=[Depends(login_check)])
-        async def file(path_or_url: str, request: fastapi.Request):
+        async def file(
+            path_or_url: str,
+            request: fastapi.Request,
+            username: str = Depends(get_current_user),
+        ):
             if client_utils.is_http_url_like(path_or_url):
                 return await secure_url_stream_response(path_or_url, request)
             blocks = app.get_blocks()
+            # Only files under the upload directory are store-owned; anything
+            # else (allowed_paths, static files) keeps the local path below.
+            if blocks.file_store is not None and utils.is_in_or_equal(
+                utils.abspath(path_or_url), utils.abspath(app.uploaded_file_dir)
+            ):
+                key = route_utils.upload_store_key(path_or_url, app.uploaded_file_dir)
+                local = blocks.fetch_file(key, username)
+                if local is None:
+                    raise HTTPException(403, f"File not allowed: {path_or_url}.")
+                return route_utils.serve_path(local, request, "created")
             return file_fetch(path_or_url, request, blocks, app.uploaded_file_dir)
 
         @router.post("/stream/{event_id}")
@@ -2214,6 +2228,7 @@ class App(FastAPI):
             request: fastapi.Request,
             bg_tasks: BackgroundTasks,
             upload_id: str | None = None,
+            username: str = Depends(get_current_user),
         ):
             start = None
             if PROFILING_ENABLED:
@@ -2232,6 +2247,18 @@ class App(FastAPI):
             except MultiPartException as exc:
                 code = 413 if "maximum allowed size" in exc.message else 400
                 return PlainTextResponse(exc.message, status_code=code)
+
+            # Commit bytes and ownership before acknowledging the upload (R5),
+            # so a file is never servable before it is attributable.
+            if blocks.file_store is not None:
+                session_hash = request.headers.get("session_hash")
+                for dest in output_files:
+                    blocks.store_upload(
+                        dest,
+                        route_utils.upload_store_key(dest, app.uploaded_file_dir),
+                        owner=username,
+                        session_hash=session_hash,
+                    )
 
             if files_to_copy:
                 bg_tasks.add_task(
