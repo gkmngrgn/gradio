@@ -144,6 +144,8 @@ class Queue:
         self.pending_message_lock = safe_get_lock()
         self.event_queue_per_concurrency_id: dict[str, EventQueue] = {}
         self.stopped = False
+        # Opt-in graceful drain window. None keeps the default immediate stop.
+        self.drain_timeout: float | None = None
         self.max_thread_count = concurrency_count
         self.update_intervals = update_intervals
         self.active_jobs: list[None | list[Event]] = []
@@ -252,8 +254,16 @@ class Queue:
             ):
                 existing_event_queue.concurrency_limit = concurrency_limit
 
-    def close(self):
+    def close(self, drain: bool = False, timeout: float | None = None):
+        """Stop accepting new work.
+
+        With ``drain=True`` the in-flight jobs are given up to ``timeout``
+        seconds to finish before they are cancelled; the default stops as
+        before.
+        """
         self.stopped = True
+        if drain:
+            self.drain_timeout = timeout
 
     def send_message(
         self,
@@ -489,6 +499,23 @@ class Queue:
             task.cancel()
         self._asyncio_tasks.clear()
 
+    async def drain(self) -> None:
+        """Let in-flight jobs finish within the drain window, then cancel.
+
+        With no window configured (the default) this cancels immediately, so
+        the single-process shutdown path is unchanged.
+        """
+        tasks = set(self._asyncio_tasks)
+        if self.drain_timeout is not None and tasks:
+            _, pending = await asyncio.wait(tasks, timeout=self.drain_timeout)
+        else:
+            pending = tasks
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._asyncio_tasks.clear()
+
     def set_server_app(self, app: routes.App):
         self.server_app = app
 
@@ -569,7 +596,7 @@ class Queue:
                     await asyncio.sleep(self.sleep_when_free)
         finally:
             self.stopped = True
-            self._cancel_asyncio_tasks()
+            await self.drain()
 
     async def start_progress_updates(self) -> None:
         """
