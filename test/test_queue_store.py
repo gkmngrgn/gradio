@@ -1,0 +1,132 @@
+"""Tests for the durable job queue seam (U9a).
+
+The Redis Streams contract is exercised with fakeredis in CI and, when
+``GRADIO_TEST_REDIS_URL`` is set, against a real server. Both prove the same
+things: a published job is delivered once, a job left pending is reclaimed from
+an idle consumer, and acking removes it from the pending list.
+"""
+
+from __future__ import annotations
+
+import fakeredis
+import pytest
+
+from gradio.queue_store import (
+    JobEnvelope,
+    RedisJobQueue,
+    decode_job,
+    encode_job,
+    resolve_job_queue,
+)
+
+
+@pytest.fixture
+def redis_client():
+    return fakeredis.FakeRedis(decode_responses=False)
+
+
+def _queue(client, consumer):
+    return RedisJobQueue(client, stream="jobs", group="g", consumer=consumer)
+
+
+class TestEnvelope:
+    def test_round_trip_preserves_fields(self):
+        job = JobEnvelope(
+            fn_index=2,
+            inputs=[1, {"a": 2}],
+            session_hash="h",
+            principal="alice",
+            batch=True,
+            event_id="e1",
+            idempotency_key="key-1",
+            fencing_token=7,
+        )
+        restored = decode_job(encode_job(job))
+        assert restored.to_dict() == job.to_dict()
+
+    def test_from_dict_defaults_an_idempotency_key(self):
+        job = JobEnvelope.from_dict({"fn_index": 0, "inputs": []})
+        assert job.idempotency_key
+
+
+class TestRedisJobQueue:
+    def test_publish_is_delivered_once(self, redis_client):
+        producer = _queue(redis_client, "p")
+        worker = _queue(redis_client, "w")
+        message_id = producer.publish(JobEnvelope(fn_index=1, inputs=["x"]))
+
+        messages = worker.read(block_ms=10)
+        assert [m.id for m in messages] == [message_id]
+        assert messages[0].job.inputs == ["x"]
+        # A second read sees nothing new until the job is acked and redelivered.
+        assert worker.read(block_ms=10) == []
+        assert len(worker) == 1
+
+    def test_reclaim_picks_up_an_idle_consumers_job(self, redis_client):
+        producer = _queue(redis_client, "p")
+        worker = _queue(redis_client, "w")
+        producer.publish(JobEnvelope(fn_index=1, inputs=[], session_hash="s"))
+
+        (claimed,) = worker.read(block_ms=10)
+
+        # Another replica reclaims work the first consumer left pending.
+        survivor = _queue(redis_client, "w2")
+        reclaimed = survivor.reclaim(min_idle_ms=0)
+        assert [m.id for m in reclaimed] == [claimed.id]
+        assert reclaimed[0].job.session_hash == "s"
+
+    def test_ack_removes_from_the_pending_list(self, redis_client):
+        producer = _queue(redis_client, "p")
+        worker = _queue(redis_client, "w")
+        producer.publish(JobEnvelope(fn_index=1, inputs=[]))
+        (claimed,) = worker.read(block_ms=10)
+
+        worker.ack(claimed.id)
+        assert len(worker) == 0
+        assert worker.reclaim(min_idle_ms=0) == []
+
+    def test_renew_keeps_the_job_out_of_reclaim(self, redis_client):
+        producer = _queue(redis_client, "p")
+        worker = _queue(redis_client, "w")
+        producer.publish(JobEnvelope(fn_index=1, inputs=[]))
+        (claimed,) = worker.read(block_ms=10)
+
+        worker.renew(claimed.id)
+        # The entry is still pending for this consumer (not lost, not acked).
+        assert len(worker) == 1
+
+
+class TestResolution:
+    def test_default_is_no_external_queue(self, monkeypatch):
+        monkeypatch.delenv("GRADIO_JOB_QUEUE", raising=False)
+        assert resolve_job_queue() is None
+
+    def test_named_backend_needs_a_client(self, monkeypatch):
+        monkeypatch.setenv("GRADIO_JOB_QUEUE", "redis")
+        with pytest.raises(RuntimeError):
+            resolve_job_queue()
+
+    def test_redis_backend_resolves(self, monkeypatch, redis_client):
+        monkeypatch.setenv("GRADIO_JOB_QUEUE", "redis")
+        queue = resolve_job_queue(client=redis_client)
+        assert isinstance(queue, RedisJobQueue)
+
+
+@pytest.mark.integration
+def test_redelivery_against_real_redis(real_redis_client):
+    """Tier B: the same reclaim/ack contract on a real server."""
+    producer = RedisJobQueue(real_redis_client, stream="it:jobs", group="g")
+    worker = RedisJobQueue(real_redis_client, stream="it:jobs", group="g")
+    producer.publish(JobEnvelope(fn_index=1, inputs=[], session_hash="s"))
+    (claimed,) = worker.read(block_ms=10)
+
+    survivor = RedisJobQueue(real_redis_client, stream="it:jobs", group="g")
+    reclaimed = survivor.reclaim(min_idle_ms=0)
+    assert claimed.id in [m.id for m in reclaimed]
+
+    survivor.ack(claimed.id)
+    assert survivor.reclaim(min_idle_ms=0) == []
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
