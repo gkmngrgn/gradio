@@ -176,21 +176,21 @@ class RedisJobQueue:
         return fields.get(encoded)
 
     def publish(self, job: JobEnvelope) -> str:
-        message_id = self._client.xadd(
-            self._key(self.stream), {JOB_FIELD: encode_job(job)}
-        )
+        # Keep enqueue + first claim atomic. Otherwise a process crash between
+        # XADD and XREADGROUP leaves an undelivered entry that reclaim-only
+        # survivors cannot see.
+        with self._client.pipeline(transaction=True) as pipe:
+            pipe.xadd(self._key(self.stream), {JOB_FIELD: encode_job(job)})
+            pipe.xreadgroup(
+                self.group,
+                self.consumer,
+                {self._key(self.stream): ">"},
+                count=1,
+                block=0,
+            )
+            message_id, _ = pipe.execute()
         message_id = (
             message_id.decode() if isinstance(message_id, bytes) else message_id
-        )
-        # The in-process queue executes the first attempt so it can stream to
-        # the submitting client. Put the durable copy in the pending list now;
-        # other replicas only reclaim it after this producer's lease expires.
-        self._client.xreadgroup(
-            self.group,
-            self.consumer,
-            {self._key(self.stream): ">"},
-            count=1,
-            block=0,
         )
         return message_id
 
