@@ -3970,6 +3970,17 @@ class TestCrossReplicaAuth:
         finally:
             demo.close()
 
+    def test_auth_secret_env_alone_does_not_change_default_auth(self, monkeypatch):
+        monkeypatch.setenv("GRADIO_AUTH_SECRET", "secret")
+        with gr.Blocks() as demo:
+            gr.Textbox()
+        app, _, _ = demo.launch(prevent_thread_lock=True, auth=[("alice", "pw")])
+        try:
+            assert app.signed_auth is None
+            assert app.tokens == {}
+        finally:
+            demo.close()
+
     def test_signed_login_round_trip_and_cookie_trust(self, monkeypatch):
         monkeypatch.delenv("GRADIO_AUTH_SECRET", raising=False)
         with gr.Blocks() as demo:

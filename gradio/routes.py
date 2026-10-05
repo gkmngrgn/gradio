@@ -439,10 +439,23 @@ class App(FastAPI):
         self.cwd = os.getcwd()
         self.favicon_path = blocks.favicon_path
         self.tokens = {}
-        # Signed tokens are opt-in: with an operator-supplied secret, a login on
-        # one replica is recognized on another. Absent a secret, the process-local
-        # `app.tokens` path is unchanged.
-        secret = getattr(blocks, "auth_secret", None) or os.getenv(AUTH_SECRET_ENV_VAR)
+        # Signed tokens are opt-in and are tied to multi-replica mode: a login
+        # on one replica is recognized on another through them. An explicit
+        # `auth_secret` attribute, or the multi-replica preset, activates them.
+        # A bare GRADIO_AUTH_SECRET env var on an otherwise single-process app
+        # would silently change /user and /logout semantics, so it is ignored
+        # with a warning unless an external store is configured.
+        explicit_secret = getattr(blocks, "auth_secret", None)
+        env_secret = os.getenv(AUTH_SECRET_ENV_VAR)
+        multi_replica = blocks.session_store is not None
+        secret = explicit_secret or (env_secret if multi_replica else None)
+        if env_secret and not multi_replica and not explicit_secret:
+            warnings.warn(
+                f"{AUTH_SECRET_ENV_VAR} is set but multi-replica mode is not "
+                f"configured; ignoring it so single-process auth behavior (and "
+                f"/logout) is unchanged. Set `auth_secret` to opt in explicitly.",
+                stacklevel=2,
+            )
         self.signed_auth = None
         if secret:
             ttl = (
