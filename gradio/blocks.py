@@ -2823,7 +2823,11 @@ Received inputs:
             and session_hash is not None
             and self.session_store is not None
         ):
-            self.save_session_state(state, session_hash, principal)
+            if not self.save_session_state(state, session_hash, principal):
+                raise Error(
+                    "Session state could not be saved because it changed during "
+                    "this request. Please retry."
+                )
 
         return output
 

@@ -208,3 +208,28 @@ class TestSerializationFailure:
         stored = demo.session_store.resolve("h", None)
         assert stored is not None
         assert stored.state_data[state._id] == "kept"
+
+
+class TestSessionSaveFailure:
+    def test_process_api_surfaces_an_exhausted_session_save(self, monkeypatch):
+        import asyncio
+
+        import gradio as gr
+        from gradio.exceptions import Error
+        from gradio.state_holder import SessionState
+
+        with gr.Blocks() as demo:
+            state = gr.State(0)
+            gr.Button().click(lambda value: value + 1, state, state)
+        demo.session_store = object()
+        monkeypatch.setattr(demo, "save_session_state", lambda *args, **kwargs: False)
+
+        with pytest.raises(Error, match="Session state could not be saved"):
+            asyncio.run(
+                demo.process_api(
+                    0,
+                    [None],
+                    state=SessionState(demo),
+                    session_hash="s1",
+                )
+            )
