@@ -489,6 +489,16 @@ async def call_process_api(
     if batch_in_single_out:
         output["data"] = output["data"][0]
 
+    # Generated file outputs are cached locally by component postprocessing.
+    # Commit them to the shared store before returning their URLs to the client.
+    if output.get("data") is not None and app.get_blocks().file_store is not None:
+        store_generated_files(
+            app.get_blocks(),
+            output["data"],
+            session_hash,
+            principal,
+        )
+
     _record_run_history(
         app,
         fn=fn,
@@ -499,6 +509,33 @@ async def call_process_api(
         is_final=not output.get("is_generating"),
     )
     return output
+
+
+def store_generated_files(
+    blocks: Blocks,
+    data: Any,
+    session_hash: str | None,
+    principal: str | None,
+) -> None:
+    """Commit generated file outputs to shared storage before returning them."""
+    if blocks.file_store is None or session_hash is None:
+        return
+
+    def store_file(file_data: dict[str, Any]) -> dict[str, Any]:
+        path = file_data.get("path")
+        if not path:
+            return file_data
+        absolute = utils.abspath(path)
+        if not utils.is_in_or_equal(absolute, blocks.GRADIO_CACHE):
+            return file_data
+        key = upload_store_key(str(absolute), blocks.GRADIO_CACHE)
+        if blocks.file_store.resolve(key, principal) is None:
+            blocks.store_upload(
+                str(absolute), key, owner=principal, session_hash=session_hash
+            )
+        return file_data
+
+    client_utils.traverse(data, store_file, client_utils.is_file_obj_with_meta)
 
 
 def _record_run_history(

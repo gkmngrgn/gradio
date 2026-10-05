@@ -1525,9 +1525,13 @@ class App(FastAPI):
             ):
                 key = route_utils.upload_store_key(path_or_url, app.uploaded_file_dir)
                 local = blocks.fetch_file(key, username)
-                if local is None:
-                    raise HTTPException(403, f"File not allowed: {path_or_url}.")
-                return route_utils.serve_path(local, request, "created")
+                if local is not None:
+                    return route_utils.serve_path(local, request, "created")
+                # No store record: a generated output file (only /upload commits)
+                # or a file this principal does not own. Serve it from the local
+                # path when it exists here, so outputs remain reachable on the
+                # producing replica; otherwise fall through to the guarded local
+                # fetch, which returns 403 for a path outside allowed roots.
             return file_fetch(path_or_url, request, blocks, app.uploaded_file_dir)
 
         @router.post("/stream/{event_id}")

@@ -9,6 +9,7 @@ in-process implementation. The route wiring itself is covered by
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -106,6 +107,28 @@ class TestBlocksWiring:
         with open(owned) as fh:
             assert fh.read() == "data"
         assert demo.fetch_file("sha/u.txt", "bob") is None
+
+    def test_generated_output_is_committed_before_its_url_is_returned(self):
+        demo = _demo()
+        hub = FakeHub()
+        demo.file_store = HfBucketFileStore("alice/files", app_id="app", client=hub)
+        generated = Path(demo.GRADIO_CACHE) / "generated.txt"
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_text("generated")
+        data = [
+            {
+                "path": str(generated),
+                "url": "/gradio_api/file=generated.txt",
+                "meta": {"_type": "gradio.FileData"},
+            }
+        ]
+
+        route_utils.store_generated_files(demo, data, "s1", "alice")
+
+        key = route_utils.upload_store_key(str(generated), demo.GRADIO_CACHE)
+        stored = demo.file_store.resolve(key, "alice")
+        assert stored is not None
+        assert stored.session_hash == "s1"
 
 
 def test_upload_store_key_is_relative_to_upload_dir(tmp_path):
