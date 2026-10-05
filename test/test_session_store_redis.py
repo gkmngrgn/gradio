@@ -114,6 +114,21 @@ class TestVersionedWrites:
         assert b.save(late, expected_version=late.version, fencing_token=4) is False
         assert a.resolve("s1", principal=None).state_data == {}
 
+    def test_watch_error_is_a_retryable_conflict(self, two_stores, monkeypatch):
+        import redis
+
+        store = two_stores[0]
+        record = store.create("s1", principal=None)
+        pipe = store._client.pipeline()
+
+        def conflicted_execute():
+            raise redis.exceptions.WatchError("concurrent update")
+
+        monkeypatch.setattr(pipe, "execute", conflicted_execute)
+        monkeypatch.setattr(store._client, "pipeline", lambda: pipe)
+
+        assert store.save(record, expected_version=record.version) is False
+
 
 class TestAtomicCreation:
     def test_concurrent_first_requests_yield_one_session(self, two_stores):

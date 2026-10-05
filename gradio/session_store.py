@@ -612,7 +612,11 @@ class RedisSessionStore:
                     pipe.expire(key, self.ttl_seconds)
                 pipe.execute()
                 return True
-            except Exception as err:  # pragma: no cover - backend failure path
+            except Exception as err:
+                # A concurrent write raises WatchError: that is a version
+                # conflict, not a serialization failure, so the caller retries.
+                if type(err).__name__ == "WatchError":
+                    return False
                 raise SessionEnvelopeError(f"Failed to save session: {err}") from err
 
     def delete(self, session_hash: str, principal: str | None = None) -> None:
