@@ -1335,9 +1335,7 @@ class Queue:
                         durable_queue = self.job_queue
                         if durable_queue is not None:
                             try:
-                                await asyncio.to_thread(
-                                    durable_queue.ack, message_id
-                                )
+                                await asyncio.to_thread(durable_queue.ack, message_id)
                             except Exception:
                                 logger.exception(
                                     "durable job ack failed after local run"
