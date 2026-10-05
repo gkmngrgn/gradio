@@ -518,7 +518,8 @@ def store_generated_files(
     principal: str | None,
 ) -> None:
     """Commit generated file outputs to shared storage before returning them."""
-    if blocks.file_store is None or session_hash is None:
+    store = blocks.file_store
+    if store is None or session_hash is None:
         return
 
     def store_file(file_data: dict[str, Any]) -> dict[str, Any]:
@@ -529,10 +530,8 @@ def store_generated_files(
         if not utils.is_in_or_equal(absolute, blocks.GRADIO_CACHE):
             return file_data
         key = upload_store_key(str(absolute), blocks.GRADIO_CACHE)
-        if blocks.file_store.resolve(key, principal) is None:
-            blocks.store_upload(
-                str(absolute), key, owner=principal, session_hash=session_hash
-            )
+        if store.resolve(key, principal) is None:
+            store.put(str(absolute), key, owner=principal, session_hash=session_hash)
         return file_data
 
     client_utils.traverse(data, store_file, client_utils.is_file_obj_with_meta)
