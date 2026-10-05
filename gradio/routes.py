@@ -1783,7 +1783,10 @@ class App(FastAPI):
             # a direct call names no job and nothing would continue the run.
             body.event_id = None
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=body,
+                principal=username,
             )
 
             if not app.get_blocks().api_open and fn.queue:
@@ -1867,7 +1870,10 @@ class App(FastAPI):
             )
             full_body = PredictBody(**simple_body.model_dump(), simple_format=True)  # type: ignore
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=full_body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=full_body,
+                principal=username,
             )
             prepare_simple_api_data(full_body, fn)
             full_body.fn_index = fn._id
@@ -1883,7 +1889,10 @@ class App(FastAPI):
         ):
             full_body = PredictBody(**body.model_dump(), simple_format=True)  # type: ignore
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=full_body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=full_body,
+                principal=username,
             )
             prepare_simple_api_data(full_body, fn)
             full_body.fn_index = fn._id
