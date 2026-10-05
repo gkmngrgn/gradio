@@ -501,7 +501,7 @@ class Queue:
         # Durable path: also publish the job to the external queue so a job the
         # replica does not finish can be redelivered to a survivor. The local
         # copy still runs it; the idempotency key ties the two together.
-        self.publish_durable_job(event, fn, body, username)
+        await self.publish_durable_job(event, fn, body, username)
         self.broadcast_estimations(event.concurrency_id, len(event_queue.queue) - 1)
         return True, event._id, "success"
 
@@ -511,7 +511,7 @@ class Queue:
             return None
         return self.job_queue
 
-    def publish_durable_job(self, event, fn, body, username) -> None:
+    async def publish_durable_job(self, event, fn, body, username) -> None:
         """Publish a queued job for redelivery; no-op without an external queue.
 
         The job's idempotency key is derived from the event so a redelivered
@@ -536,7 +536,7 @@ class Queue:
         # this replica's own copy.
         self._local_job_keys.add(job.idempotency_key)
         try:
-            message_id = queue.publish(job)
+            message_id = await asyncio.to_thread(queue.publish, job)
             self._local_job_messages[job.idempotency_key] = message_id
             self._local_job_renewers[job.idempotency_key] = run_coro_in_background(
                 self._renew_lease, queue, message_id
@@ -604,7 +604,7 @@ class Queue:
         job = message.job
         key = job.idempotency_key
         if key in self._applied_job_keys:
-            queue.ack(message.id)
+            await asyncio.to_thread(queue.ack, message.id)
             return False
         if key in self._local_job_keys:
             # This replica queued and is running the job locally. Leave the
@@ -656,7 +656,7 @@ class Queue:
         # Work is applied (or terminally failed); record the key so a
         # redelivery does not re-run it, then ack.
         self._applied_job_keys.add(key)
-        queue.ack(message.id)
+        await asyncio.to_thread(queue.ack, message.id)
         return True
 
     async def _renew_lease(self, queue, message_id: str) -> None:
@@ -664,7 +664,7 @@ class Queue:
         while True:
             await asyncio.sleep(self.job_lease_renew_interval)
             try:
-                queue.renew(message_id)
+                await asyncio.to_thread(queue.renew, message_id)
             except Exception:
                 logger.debug("durable job lease renew failed", exc_info=True)
 
