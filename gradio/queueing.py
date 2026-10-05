@@ -1332,10 +1332,16 @@ class Queue:
                         # process_events returns after call_process_api saves
                         # session state, so ack only after the durable write.
                         self._applied_job_keys.add(event._id)
-                        try:
-                            await asyncio.to_thread(self.job_queue.ack, message_id)
-                        except Exception:
-                            logger.exception("durable job ack failed after local run")
+                        durable_queue = self.job_queue
+                        if durable_queue is not None:
+                            try:
+                                await asyncio.to_thread(
+                                    durable_queue.ack, message_id
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "durable job ack failed after local run"
+                                )
 
                 self.event_ids_to_events.pop(event._id, None)
 
