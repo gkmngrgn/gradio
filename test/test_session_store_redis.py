@@ -131,13 +131,13 @@ class TestVersionedWrites:
 
 
 class TestAtomicCreation:
-    def test_concurrent_first_requests_yield_one_session(self, two_stores):
+    def test_resolve_then_create_yields_one_session(self, two_stores):
         a, b = two_stores
-        ra = a.resolve_or_create("s1", principal=None)
-        rb = b.resolve_or_create("s1", principal=None)
+        ra = a.resolve("s1", principal=None) or a.create("s1", principal=None)
+        rb = b.resolve("s1", principal=None) or b.create("s1", principal=None)
         # The second call must observe the first, not overwrite it.
         assert ra.version == rb.version
-        assert a._client.exists(a._key("s1")) in (0, 1)
+        assert a.resolve("s1", principal=None) is not None
 
     def test_create_is_set_nx_guarded(self, two_stores):
         a = two_stores[0]

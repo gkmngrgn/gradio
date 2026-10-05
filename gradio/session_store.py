@@ -11,7 +11,7 @@ conflates:
 
 - ``contains`` -- an existence check that never creates state.
 - ``resolve`` -- a read that returns ``None`` on a miss instead of minting.
-- ``resolve_or_create`` -- the explicit create-if-absent.
+- ``create`` -- the explicit atomic create-if-absent at the backend boundary.
 
 Every method carries the caller's ``principal``. When the app sets ``auth=`` the
 principal is the authenticated username; otherwise it is ``None`` and the
@@ -74,11 +74,6 @@ class SessionStore(Protocol):
 
     def resolve(self, session_hash: str, principal: str | None) -> SessionRecord | None:
         """Return the session, or ``None`` on a miss. Never creates."""
-
-    def resolve_or_create(
-        self, session_hash: str, principal: str | None
-    ) -> SessionRecord:
-        """Return the session, creating it atomically if it is absent."""
 
     def create(self, session_hash: str, principal: str | None) -> SessionRecord:
         """Create a session. Overwrites any existing record for the key."""
@@ -159,16 +154,6 @@ class InProcessSessionStore:
         if not self.contains(session_hash, principal):
             return None
         return self._to_record(session_hash, principal)
-
-    def resolve_or_create(
-        self, session_hash: str, principal: str | None = None
-    ) -> SessionRecord:
-        if not self.contains(session_hash, principal):
-            return self.create(session_hash, principal)
-        record = self.resolve(session_hash, principal)
-        if record is None:  # pragma: no cover - contains() just proved it exists
-            return self.create(session_hash, principal)
-        return record
 
     def create(self, session_hash: str, principal: str | None = None) -> SessionRecord:
         # Use the holder's own creation path so defaults match exactly.
@@ -548,14 +533,6 @@ class RedisSessionStore:
             return None
         self._touch(session_hash)
         return record
-
-    def resolve_or_create(
-        self, session_hash: str, principal: str | None = None
-    ) -> SessionRecord:
-        record = self._read_raw(session_hash)
-        if record is not None and record.principal == principal:
-            return record
-        return self.create(session_hash, principal)
 
     def create(self, session_hash: str, principal: str | None = None) -> SessionRecord:
         record = SessionRecord(

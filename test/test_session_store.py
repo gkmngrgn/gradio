@@ -60,7 +60,7 @@ class TestRoundTrip:
         store = _store()
         store.capacity = 2
         for i in range(5):
-            store.resolve_or_create(f"s{i}", principal=None)
+            store.create(f"s{i}", principal=None)
         assert len(store) == 2
 
     def test_no_create_resolve_does_not_exercise_capacity(self):
@@ -83,10 +83,14 @@ class TestExistenceCheckDoesNotCreate:
         assert store.resolve("missing", principal=None) is None
         assert len(store) == 0
 
-    def test_resolve_or_create_mints_once(self):
+    def test_resolve_then_create_mints_once(self):
         store = _store()
-        first = store.resolve_or_create("s1", principal=None)
-        second = store.resolve_or_create("s1", principal=None)
+        first = store.resolve("s1", principal=None) or store.create(
+            "s1", principal=None
+        )
+        second = store.resolve("s1", principal=None) or store.create(
+            "s1", principal=None
+        )
         assert first.session_hash == second.session_hash
         assert len(store) == 1
 
@@ -154,7 +158,7 @@ class TestRetiresWithStateHolder:
         holder = StateHolder()
         holder.set_blocks(_demo())
         store = InProcessSessionStore.from_holder(holder)
-        record = store.resolve_or_create("s1", principal=None)
+        record = store.create("s1", principal=None)
         assert record.session_hash == "s1"
 
 
