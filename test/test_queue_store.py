@@ -269,6 +269,32 @@ class TestRedeliveryConsumer:
         finally:
             demo.close()
 
+    def test_durable_consumer_is_tracked_and_exits_on_shutdown(self):
+        import gradio as gr
+
+        class EmptyQueue:
+            lease_ms = 10
+
+            def reclaim(self, min_idle_ms, count=10):
+                return []
+
+        with gr.Blocks() as demo:
+            gr.Button()
+        queue = demo._queue
+        queue.job_queue = EmptyQueue()
+
+        async def check():
+            queue.start_durable_consumer()
+            task = queue._durable_task
+            assert task is not None
+            assert task in queue._asyncio_tasks
+            queue.stopped = True
+            await asyncio.wait_for(task, timeout=2)
+            assert task not in queue._asyncio_tasks
+            assert queue._durable_task is None
+
+        asyncio.run(check())
+
 
 @pytest.mark.integration
 def test_redelivery_against_real_redis(real_redis_client):

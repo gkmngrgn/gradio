@@ -555,15 +555,17 @@ class Queue:
         pending past the lease, then runs each on this replica. No-op without an
         external queue.
         """
-        if self.job_queue is None or self._durable_task is not None:
+        if self.job_queue is None or (
+            self._durable_task is not None and not self._durable_task.done()
+        ):
             return
         self._durable_task = run_coro_in_background(self.consume_durable_jobs)
+        self._asyncio_tasks.add(self._durable_task)
+        self._durable_task.add_done_callback(self._durable_task_done)
 
-    async def stop_durable_consumer(self) -> None:
-        if self._durable_task is not None:
-            self._durable_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._durable_task
+    def _durable_task_done(self, task: asyncio.Task) -> None:
+        self._asyncio_tasks.discard(task)
+        if self._durable_task is task:
             self._durable_task = None
 
     async def consume_durable_jobs(self) -> None:

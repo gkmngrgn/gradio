@@ -3070,7 +3070,6 @@ Received inputs:
                 **queue_cfg,
             }
         self._queue.job_queue = resolve_job_queue(queue_backend, **queue_cfg)
-        self._queue.start_durable_consumer()
 
     def store_upload(
         self,
@@ -4314,6 +4313,7 @@ Received inputs:
         self._queue.start()
         # So that processing can resume in case the queue was stopped
         self._queue.stopped = False
+        self._queue.start_durable_consumer()
         self.is_running = True
         self.create_limiter()
 
