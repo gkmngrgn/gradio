@@ -4,8 +4,8 @@ Every turn must increment the same session counter by exactly one, while
 the serving replica ids show the turns actually hopped across replicas.
 
 Run (from the repo root, Docker daemon up):
-    docker compose -f test/multi-replica/docker-compose.demo.yml up -d --scale app=10
-    python test/multi-replica/sync_check.py --turns 20
+    docker compose -f demo/multi_replica_counter/docker-compose.yml up -d --scale app=10
+    python demo/multi_replica_counter/sync_check.py --turns 20
 """
 
 import argparse
