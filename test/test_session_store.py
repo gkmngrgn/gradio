@@ -132,6 +132,18 @@ class TestVersionedWrites:
         assert stored is not None
         assert stored.version == 1
 
+    def test_stale_fencing_token_is_rejected(self):
+        store = _store()
+        record = store.create("s1", principal=None)
+        assert store.save(record, expected_version=0, fencing_token=5) is True
+
+        stale = store.resolve("s1", principal=None)
+        assert stale is not None
+        version = stale.version
+        # A superseded worker holding an older token cannot overwrite.
+        assert store.save(stale, expected_version=version, fencing_token=3) is False
+        assert store.save(stale, expected_version=version, fencing_token=5) is True
+
 
 class TestRecordingWrapsExistingHolder:
     def test_record_exposes_state_and_closed_at(self):

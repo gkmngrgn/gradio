@@ -82,7 +82,13 @@ from gradio.helpers import create_tracker, skip, special_args
 from gradio.i18n import I18n, I18nData
 from gradio.node_server import start_node_server
 from gradio.route_utils import API_PREFIX, MediaStream, principal_from_request, slugify
-from gradio.routes import INTERNAL_ROUTES, VERSION, App, Request
+from gradio.routes import (
+    AUTH_SECRET_ENV_VAR,
+    INTERNAL_ROUTES,
+    VERSION,
+    App,
+    Request,
+)
 from gradio.session_store import (
     SessionEnvelopeError,
     SessionRecord,
@@ -2869,8 +2875,8 @@ Received inputs:
         state = SessionState(self)
         state.state_data.update(record.state_data)
         state.is_closed = record.is_closed
-        state._session_record = record  # type: ignore[attr-defined]
-        state._session_snapshot = dict(record.state_data)  # type: ignore[attr-defined]
+        state._session_record = record
+        state._session_snapshot = dict(record.state_data)
         return state
 
     def save_session_state(
@@ -2878,6 +2884,7 @@ Received inputs:
         state: SessionState,
         session_hash: str,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         """Persist a session through the configured store.
 
@@ -2913,15 +2920,18 @@ Received inputs:
             record.is_closed = state.is_closed
             try:
                 saved = store.save(
-                    record, expected_version=expected, principal=principal
+                    record,
+                    expected_version=expected,
+                    principal=principal,
+                    fencing_token=fencing_token,
                 )
             except SessionEnvelopeError as err:
                 raise self._session_envelope_error(
                     state, session_hash, principal, err
                 ) from err
             if saved:
-                state._session_record = record  # type: ignore[attr-defined]
-                state._session_snapshot = dict(state.state_data)  # type: ignore[attr-defined]
+                state._session_record = record
+                state._session_snapshot = dict(state.state_data)
                 return True
             latest = store.resolve(session_hash, principal)
             if latest is None:
@@ -2966,6 +2976,101 @@ Received inputs:
                 )
         return error
 
+    def configure_multi_replica(self, config: dict[str, Any] | None) -> None:
+        """Wire the multi-replica seams from one configuration.
+
+        Opt-in. Absent (``None`` and no ``GRADIO_MULTI_REPLICA``), every seam
+        stays at its in-process default, so single-process behavior and
+        dependencies are unchanged. Credentials are validated here, at launch,
+        and an invalid drain/lease pair fails fast.
+        """
+        from gradio.file_store import resolve_file_store
+        from gradio.queue_store import resolve_job_queue
+        from gradio.session_store import resolve_session_store
+
+        env_config = os.getenv("GRADIO_MULTI_REPLICA")
+        if config is None:
+            if not env_config:
+                return
+            # The environment variable carries the configuration as JSON, so a
+            # deploy can opt in without changing app code.
+            try:
+                config = json.loads(env_config)
+            except (TypeError, ValueError) as err:
+                raise Error(f"GRADIO_MULTI_REPLICA is not valid JSON: {err}") from err
+        config = dict(config or {})
+
+        # Credentials are operator-supplied; a missing URL fails launch rather
+        # than silently running a store the app cannot reach. The Redis client
+        # is imported lazily, so the default install never depends on it.
+        def _redis_client(cfg: dict, what: str):
+            # An injected client (tests, advanced callers) wins; otherwise build
+            # one from the operator-supplied URL and fail launch when it is absent.
+            if cfg.get("client") is not None:
+                return cfg.pop("client")
+            url = cfg.pop("url", None) or os.getenv("GRADIO_REDIS_URL")
+            if not url:
+                raise Error(
+                    f"multi_replica: no URL for {what}. Supply it in the launch "
+                    f"configuration or the matching GRADIO_* environment variable."
+                )
+            import redis  # ty: ignore[unresolved-import]
+
+            return redis.Redis.from_url(url, decode_responses=False)
+
+        # --- session state ---
+        session_cfg = dict(config.get("session", {}))
+        backend = session_cfg.pop("backend", "redis")
+        if backend in ("redis", "redis-session"):
+            session_cfg = {
+                "client": _redis_client(session_cfg, "the session store"),
+                **session_cfg,
+            }
+        self.session_store = resolve_session_store(backend, blocks=self, **session_cfg)
+
+        # --- files (Hugging Face Storage Bucket) ---
+        file_cfg = dict(config.get("files", {}))
+        bucket = file_cfg.pop("bucket", None) or os.getenv("GRADIO_FILE_BUCKET")
+        if not bucket:
+            raise Error(
+                "multi_replica: no file bucket. Supply `files.bucket` or "
+                "GRADIO_FILE_BUCKET."
+            )
+        self.file_store = resolve_file_store(
+            file_cfg.pop("backend", "hf"),
+            bucket=bucket,
+            token=file_cfg.pop("token", None) or os.getenv("HF_TOKEN"),
+            **file_cfg,
+        )
+
+        # --- auth ---
+        secret = config.get("auth_secret") or os.getenv(AUTH_SECRET_ENV_VAR)
+        if secret:
+            self.auth_secret = secret
+        if config.get("auth_token_ttl"):
+            self.auth_token_ttl = int(config["auth_token_ttl"])
+
+        # --- durable queue + drain ---
+        queue_cfg = dict(config.get("queue", {}))
+        lease_ttl = queue_cfg.get("lease_ms", 60_000) / 1000.0
+        self.drain_window = config.get("drain_window")
+        if self.drain_window is not None:
+            # KTD3/KTD4: the drain must finish before the lease can expire, or a
+            # live-but-draining replica overlaps a redelivery.
+            if lease_ttl <= self.drain_window:
+                raise Error(
+                    f"multi_replica: drain_window ({self.drain_window}s) must be "
+                    f"less than the queue lease TTL ({lease_ttl}s)."
+                )
+            self._queue.drain_timeout = float(self.drain_window)
+        queue_backend = queue_cfg.pop("backend", "redis")
+        if queue_backend in ("redis", "redis-streams", "streams"):
+            queue_cfg = {
+                "client": _redis_client(queue_cfg, "the job queue"),
+                **queue_cfg,
+            }
+        self._queue.job_queue = resolve_job_queue(queue_backend, **queue_cfg)
+
     def store_upload(
         self,
         local_path: str,
@@ -2986,6 +3091,37 @@ Received inputs:
         if store is None:
             return None
         return store.materialize(key, principal)
+
+    def sweep_sessions(self, closed_retention: float = 3600.0) -> int:
+        """Remove closed sessions past retention and clean up their state.
+
+        Runs each removed session's component ``delete_callback`` and returns
+        the number removed. The in-process path keeps the ``StateHolder``
+        behavior unchanged (``delete_all_expired_state`` handles it).
+        """
+        store = self.session_store
+        if store is None:
+            return 0
+        removed = store.sweep(closed_retention=closed_retention)
+        from gradio.components import State
+
+        for record in removed:
+            # Only gr.State values carry a delete_callback; component config is
+            # rebuilt per replica and is not cleaned up here.
+            for key, value in record.state_data.items():
+                component = self.default_config.blocks.get(key)
+                if not isinstance(component, State):
+                    continue
+                try:
+                    component.delete_callback(value)
+                except Exception:
+                    # Cleanup must not stop the sweep for the other sessions.
+                    warnings.warn(
+                        f"session sweep delete_callback failed for "
+                        f"{record.session_hash}",
+                        stacklevel=2,
+                    )
+        return len(removed)
 
     def get_state_ids_to_track(
         self, block_fn: BlockFunction, state: SessionState | None
@@ -3287,6 +3423,7 @@ Received inputs:
         pwa: bool | None = None,
         mcp_server: bool | None = None,
         num_workers: int | None = None,
+        multi_replica: dict[str, Any] | None = None,
         _app: App | None = None,
         _frontend: bool = True,
         i18n: I18n | None = None,
@@ -3339,6 +3476,7 @@ Received inputs:
             i18n: An I18n instance containing custom translations, which are used to translate strings in our components (e.g. the labels of components or Markdown strings). This feature can only be used to translate static text in the frontend, not values in the backend.
             mcp_server: If True, the Gradio app will be set up as an MCP server and documented functions will be added as MCP tools. If None (default behavior), then the GRADIO_MCP_SERVER environment variable will be used to determine if the MCP server should be enabled.
             num_workers: Number of background workers to launch in the background to serve file I/O and static assets. This offloads traffic from the main server and reduces latency. Only has an effect if ssr mode is set.
+            multi_replica: Opt into multi-replica mode. A dict wiring the external stores, e.g. `{"session": {"url": ...}, "files": {"bucket": ...}, "queue": {"url": ...}, "auth_secret": ..., "drain_window": 20}`. Absent (and with `GRADIO_MULTI_REPLICA` unset), every seam stays at its in-process default, so single-process behavior and dependencies are unchanged. Credentials are validated here and an invalid drain/lease pair fails launch.
             theme: A Theme object or a string representing a theme. If a string, will look for a built-in theme with that name (e.g. "soft" or "default"), or will attempt to load a theme from the Hugging Face Hub (e.g. "gradio/monochrome"). If None, will use the Default theme.
             css: Custom css as a code string. This css will be included in the demo webpage.
             css_paths: Custom css as a pathlib.Path to a css file or a list of such paths. This css files will be read, concatenated, and included in the demo webpage. If the `css` parameter is also set, the css from `css` will be included first.
@@ -3467,6 +3605,8 @@ Received inputs:
 
         self.validate_queue_settings()
         self.max_file_size = utils._parse_file_size(max_file_size)
+
+        self.configure_multi_replica(multi_replica)
 
         if self.dev_mode:
             for block in self.blocks.values():
@@ -4135,7 +4275,12 @@ Received inputs:
             ):
                 self._static_worker_pool.shutdown()
                 self._static_worker_pool = None
-            self._queue.close()
+            # With a drain window configured, in-flight jobs finish before the
+            # process exits; otherwise close stops as before.
+            if getattr(self._queue, "drain_timeout", None) is not None:
+                self._queue.close(drain=True, timeout=self._queue.drain_timeout)
+            else:
+                self._queue.close()
             # set this before closing server to shut down heartbeats
             self.is_running = False
             self.app.stop_event.set()
@@ -4168,6 +4313,7 @@ Received inputs:
         self._queue.start()
         # So that processing can resume in case the queue was stopped
         self._queue.stopped = False
+        self._queue.start_durable_consumer()
         self.is_running = True
         self.create_limiter()
 

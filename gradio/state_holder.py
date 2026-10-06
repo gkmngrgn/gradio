@@ -75,6 +75,10 @@ class SessionState:
         self.state_data: dict[int, Any] = {}
         self._state_ttl = {}
         self.is_closed = False
+        # Set only on the external-store path, to carry the versioned record and
+        # the values this turn loaded, so a save can retry on a stale version.
+        self._session_record = None
+        self._session_snapshot: dict[int, Any] | None = None
         # When a session is closed, the state is stored for an hour to give the user time to reopen the session.
         # During testing we set to a lower value to be able to test
         self.STATE_TTL_WHEN_CLOSED = (

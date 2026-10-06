@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
+import logging
 import os
 import platform
 import random
@@ -51,6 +53,8 @@ from gradio.utils import (
 )
 
 from .block_function import BlockFunction
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from gradio.block_function import BlockFunction
@@ -144,6 +148,8 @@ class Queue:
         self.pending_message_lock = safe_get_lock()
         self.event_queue_per_concurrency_id: dict[str, EventQueue] = {}
         self.stopped = False
+        # Opt-in graceful drain window. None keeps the default immediate stop.
+        self.drain_timeout: float | None = None
         self.max_thread_count = concurrency_count
         self.update_intervals = update_intervals
         self.active_jobs: list[None | list[Event]] = []
@@ -160,6 +166,20 @@ class Queue:
         self.max_size = max_size
         self.blocks = blocks
         self._asyncio_tasks: set[asyncio.Task] = set()
+        # External durable queue for redelivery. None keeps the pure in-process
+        # behavior; U12 wires it from configuration.
+        self.job_queue = None
+        # Idempotency keys whose work has been applied, and the lease-renewal
+        # interval for a running durable job.
+        self._applied_job_keys: set[str] = set()
+        # Keys this process published and is running locally. The durable
+        # consumer skips these, so a job is not executed twice on the replica
+        # that queued it (see run_durable_job).
+        self._local_job_keys: set[str] = set()
+        self._local_job_messages: dict[str, str] = {}
+        self._local_job_renewers: dict[str, asyncio.Task] = {}
+        self.job_lease_renew_interval = 20.0
+        self._durable_task: asyncio.Task | None = None
         self.default_concurrency_limit = self._resolve_concurrency_limit(
             default_concurrency_limit
         )
@@ -252,8 +272,16 @@ class Queue:
             ):
                 existing_event_queue.concurrency_limit = concurrency_limit
 
-    def close(self):
+    def close(self, drain: bool = False, timeout: float | None = None):
+        """Stop accepting new work.
+
+        With ``drain=True`` the in-flight jobs are given up to ``timeout``
+        seconds to finish before they are cancelled; the default stops as
+        before.
+        """
         self.stopped = True
+        if drain:
+            self.drain_timeout = timeout
 
     def send_message(
         self,
@@ -470,8 +498,175 @@ class Queue:
         while len(self.event_analytics) > self.ANALYTICS_MAX_EVENTS:
             self.event_analytics.pop(next(iter(self.event_analytics)))
 
+        # Durable path: also publish the job to the external queue so a job the
+        # replica does not finish can be redelivered to a survivor. The local
+        # copy still runs it; the idempotency key ties the two together.
+        await self.publish_durable_job(event, fn, body, username)
         self.broadcast_estimations(event.concurrency_id, len(event_queue.queue) - 1)
         return True, event._id, "success"
+
+    def durable_jobs(self):
+        """The configured external job queue, or None for the in-process path."""
+        if self.job_queue is None:
+            return None
+        return self.job_queue
+
+    async def publish_durable_job(self, event, fn, body, username) -> None:
+        """Publish a queued job for redelivery; no-op without an external queue.
+
+        The job's idempotency key is derived from the event so a redelivered
+        duplicate can be detected, and it is bound to the caller's principal so
+        a survivor resolves the session as the same owner.
+        """
+        from gradio.queue_store import JobEnvelope
+
+        queue = self.durable_jobs()
+        if queue is None:
+            return
+        job = JobEnvelope(
+            fn_index=fn._id,
+            inputs=body.data,
+            session_hash=body.session_hash,
+            principal=username,
+            batch=body.batched,
+            event_id=event._id,
+            idempotency_key=event._id,
+        )
+        # Mark the key before publishing so the consumer can never claim and run
+        # this replica's own copy.
+        self._local_job_keys.add(job.idempotency_key)
+        try:
+            message_id = await asyncio.to_thread(queue.publish, job)
+            self._local_job_messages[job.idempotency_key] = message_id
+            self._local_job_renewers[job.idempotency_key] = run_coro_in_background(
+                self._renew_lease, queue, message_id
+            )
+        except Exception:
+            # The local copy still runs; a publish failure must not drop the
+            # request that is already on the in-process queue.
+            self._local_job_keys.discard(job.idempotency_key)
+            self._local_job_messages.pop(job.idempotency_key, None)
+            logger.exception("durable job publish failed")
+
+    def start_durable_consumer(self) -> None:
+        """Start the loop that runs jobs redelivered to this replica.
+
+        The consumer reads new jobs and reclaims jobs an earlier consumer left
+        pending past the lease, then runs each on this replica. No-op without an
+        external queue.
+        """
+        if self.job_queue is None or (
+            self._durable_task is not None and not self._durable_task.done()
+        ):
+            return
+        self._durable_task = run_coro_in_background(self.consume_durable_jobs)
+        self._asyncio_tasks.add(self._durable_task)
+        self._durable_task.add_done_callback(self._durable_task_done)
+
+    def _durable_task_done(self, task: asyncio.Task) -> None:
+        self._asyncio_tasks.discard(task)
+        if self._durable_task is task:
+            self._durable_task = None
+
+    async def consume_durable_jobs(self) -> None:
+        queue = self.job_queue
+        if queue is None:
+            return
+        lease_ms = getattr(queue, "lease_ms", 60_000)
+        while not self.stopped:
+            try:
+                # New jobs run in the local queue so the submitting client can
+                # receive its stream. This worker only takes over jobs whose
+                # producer lease expired. Redis I/O stays off the event loop.
+                messages = await asyncio.to_thread(queue.reclaim, min_idle_ms=lease_ms)
+                for message in messages:
+                    await self.run_durable_job(message)
+                if not messages:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("durable consumer loop error")
+                await asyncio.sleep(1.0)
+
+    async def run_durable_job(self, message) -> bool:
+        """Run one claimed job, then ack it only after the work is applied.
+
+        The queue's message id is the idempotency key: a redelivered job whose
+        work was already applied is acked without re-running, and the ack is
+        ordered after `process_events` returns (which is after the session save
+        inside `call_process_api`), so a crash between the two redelivers rather
+        than losing state.
+        """
+        queue = self.job_queue
+        if queue is None:
+            return False
+        job = message.job
+        key = job.idempotency_key
+        if key in self._applied_job_keys:
+            await asyncio.to_thread(queue.ack, message.id)
+            return False
+        if key in self._local_job_keys:
+            # This replica queued and is running the job locally. Leave the
+            # entry pending: if the local run never finishes, the lease expires
+            # and a survivor reclaims it; if it finishes, the key moves to
+            # _applied_job_keys and a later claim acks it.
+            return False
+
+        blocks = self.blocks
+        fn = blocks.fns.get(job.fn_index)
+        if fn is None:
+            # The function is not in this app's config; leave it for a replica
+            # that has it.
+            return False
+
+        self.create_event_queue_for_fn(fn)
+        # A redelivered job has no client request; synthesize one from the
+        # app's own local URL so processing has a request to compile against.
+        request = _starlette_request_from_local_url(blocks)
+        event = Event(
+            job.session_hash,
+            fn,
+            request=request,  # type: ignore[arg-type]
+            username=job.principal,
+        )
+        body = PredictBodyInternal(
+            data=job.inputs,
+            fn_index=job.fn_index,
+            session_hash=job.session_hash,
+            batched=bool(job.batch),
+            request=request,  # type: ignore[arg-type]
+        )
+        body.event_id = event._id
+        event.data = body
+        self.event_ids_to_events[event._id] = event
+        # A redelivered job has no live client channel; buffered messages are
+        # dropped when the run finishes.
+        self.pending_messages_per_session.setdefault(event.session_hash, AsyncQueue())
+
+        renewer = asyncio.create_task(self._renew_lease(queue, message.id))
+        try:
+            await self.process_events([event], bool(job.batch), time.time(), fn)
+        finally:
+            renewer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renewer
+            self.event_ids_to_events.pop(event._id, None)
+
+        # Work is applied (or terminally failed); record the key so a
+        # redelivery does not re-run it, then ack.
+        self._applied_job_keys.add(key)
+        await asyncio.to_thread(queue.ack, message.id)
+        return True
+
+    async def _renew_lease(self, queue, message_id: str) -> None:
+        """Keep a running job's lease alive so a healthy replica is not preempted."""
+        while True:
+            await asyncio.sleep(self.job_lease_renew_interval)
+            try:
+                await asyncio.to_thread(queue.renew, message_id)
+            except Exception:
+                logger.debug("durable job lease renew failed", exc_info=True)
 
     async def remove_from_queue(self, event_id: str):
         event = self.event_ids_to_events.get(event_id)
@@ -487,6 +682,23 @@ class Queue:
     def _cancel_asyncio_tasks(self):
         for task in list(self._asyncio_tasks):
             task.cancel()
+        self._asyncio_tasks.clear()
+
+    async def drain(self) -> None:
+        """Let in-flight jobs finish within the drain window, then cancel.
+
+        With no window configured (the default) this cancels immediately, so
+        the single-process shutdown path is unchanged.
+        """
+        tasks = set(self._asyncio_tasks)
+        if self.drain_timeout is not None and tasks:
+            _, pending = await asyncio.wait(tasks, timeout=self.drain_timeout)
+        else:
+            pending = tasks
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         self._asyncio_tasks.clear()
 
     def set_server_app(self, app: routes.App):
@@ -569,7 +781,7 @@ class Queue:
                     await asyncio.sleep(self.sleep_when_free)
         finally:
             self.stopped = True
-            self._cancel_asyncio_tasks()
+            await self.drain()
 
     async def start_progress_updates(self) -> None:
         """
@@ -1109,6 +1321,26 @@ class Queue:
                     list(self.event_analytics.values()),
                 )
 
+                message_id = self._local_job_messages.pop(event._id, None)
+                if message_id is not None:
+                    self._local_job_keys.discard(event._id)
+                    renewer = self._local_job_renewers.pop(event._id, None)
+                    if renewer is not None:
+                        renewer.cancel()
+                        await asyncio.gather(renewer, return_exceptions=True)
+                    if success:
+                        # process_events returns after call_process_api saves
+                        # session state, so ack only after the durable write.
+                        self._applied_job_keys.add(event._id)
+                        durable_queue = self.job_queue
+                        if durable_queue is not None:
+                            try:
+                                await asyncio.to_thread(durable_queue.ack, message_id)
+                            except Exception:
+                                logger.exception(
+                                    "durable job ack failed after local run"
+                                )
+
                 self.event_ids_to_events.pop(event._id, None)
 
     async def reset_iterators(self, event_id: str):
@@ -1126,6 +1358,35 @@ class Queue:
                 pass
             del app.iterators[event_id]
         return
+
+
+def _starlette_request_from_local_url(blocks: Blocks) -> fastapi.Request:
+    """A minimal request for a job that has no client connection (redelivery).
+
+    Uses the app's own local URL so route/root-path derivation works; there is
+    no client to receive messages, which `run_durable_job` accounts for.
+    """
+    from starlette.requests import Request as StarletteRequest
+
+    path = f"{route_utils.API_PREFIX}/queue/join"
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"localhost")],
+        "server": ("localhost", 0),
+        "client": ("localhost", 0),
+    }
+
+    async def receive() -> dict:
+        return {"type": "http.request"}
+
+    return StarletteRequest(scope, receive=receive)  # type: ignore[arg-type]
 
 
 def create_validator_fn(fn: BlockFunction) -> BlockFunction:

@@ -25,6 +25,7 @@ import base64
 import datetime
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -50,6 +51,12 @@ class SessionRecord:
     state_data: dict[int, Any] = field(default_factory=dict)
     is_closed: bool = False
     version: int = 0
+    # Highest fencing token that has written this session. A write carrying a
+    # lower token is a superseded worker's late write and is rejected.
+    fencing_token: int = 0
+    # Epoch seconds when the session was closed, so a closed session is retained
+    # for its TTL and then swept. 0 while the session is open.
+    closed_at: float = 0.0
 
     @property
     def owner(self) -> str | None:
@@ -76,16 +83,22 @@ class SessionStore(Protocol):
         record: SessionRecord,
         expected_version: int,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         """Persist ``record`` if its stored version still equals
-        ``expected_version``. Returns ``False`` on a version mismatch or an
-        ownership mismatch, so the caller can retry."""
+        ``expected_version``. Returns ``False`` on a version mismatch, an
+        ownership mismatch, or a stale ``fencing_token``, so the caller can
+        retry."""
 
     def delete(self, session_hash: str, principal: str | None = None) -> None:
         """Remove a session."""
 
-    def delete_all_expired_state(self) -> None:
-        """Run the expiry sweep."""
+    def sweep(self, closed_retention: float = 3600.0) -> list[SessionRecord]:
+        """Remove closed sessions past their retention.
+
+        Returns the records that were removed, so the caller can run each
+        component's ``delete_callback``.
+        """
 
     def __len__(self) -> int:
         """Number of stored sessions (used for capacity eviction)."""
@@ -107,6 +120,8 @@ class InProcessSessionStore:
             self._holder.set_blocks(blocks)
         self._principals: dict[str, str | None] = {}
         self._versions: dict[str, int] = {}
+        self._fencing: dict[str, int] = {}
+        self._closed_at: dict[str, float] = {}
 
     @classmethod
     def from_holder(cls, holder: StateHolder) -> InProcessSessionStore:
@@ -145,6 +160,7 @@ class InProcessSessionStore:
         self._holder[session_hash]
         self._principals[session_hash] = principal
         self._versions[session_hash] = 0
+        self._closed_at.pop(session_hash, None)
         return self._to_record(session_hash, principal)
 
     def save(
@@ -152,6 +168,7 @@ class InProcessSessionStore:
         record: SessionRecord,
         expected_version: int,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         if not self._owns(record.session_hash, principal):
             return False
@@ -162,10 +179,25 @@ class InProcessSessionStore:
         # only when the caller's expectation matches what the store holds.
         if self._versions.get(record.session_hash, 0) != expected_version:
             return False
+        # Same for the fencing token: a write carrying a stale one is a
+        # superseded worker's late write. None skips the check (default path).
+        if (
+            fencing_token is not None
+            and self._fencing.get(record.session_hash, 0) > fencing_token
+        ):
+            return False
         state.state_data.clear()
         state.state_data.update(record.state_data)
         state.is_closed = record.is_closed
         self._versions[record.session_hash] = expected_version + 1
+        if fencing_token is not None:
+            self._fencing[record.session_hash] = fencing_token
+            record.fencing_token = fencing_token
+        # Stamp the close time once, so retention is measured from it.
+        if record.is_closed and record.session_hash not in self._closed_at:
+            self._closed_at[record.session_hash] = time.time()
+        elif not record.is_closed:
+            self._closed_at.pop(record.session_hash, None)
         record.version = expected_version + 1
         return True
 
@@ -177,9 +209,22 @@ class InProcessSessionStore:
         self._holder.time_last_used.pop(session_hash, None)
         self._principals.pop(session_hash, None)
         self._versions.pop(session_hash, None)
+        self._fencing.pop(session_hash, None)
+        self._closed_at.pop(session_hash, None)
 
-    def delete_all_expired_state(self) -> None:
-        self._holder.delete_all_expired_state()
+    def sweep(self, closed_retention: float = 3600.0) -> list[SessionRecord]:
+        now = time.time()
+        doomed: list[str] = []
+        for session_hash in list(self._holder.session_data):
+            closed_at = self._closed_at.get(session_hash)
+            if closed_at is not None and now - closed_at > closed_retention:
+                doomed.append(session_hash)
+        removed = []
+        for session_hash in doomed:
+            record = self._to_record(session_hash, self._principals.get(session_hash))
+            self.delete(session_hash)
+            removed.append(record)
+        return removed
 
     def _to_record(self, session_hash: str, principal: str | None) -> SessionRecord:
         state = self._holder.session_data[session_hash]
@@ -189,6 +234,7 @@ class InProcessSessionStore:
             state_data=dict(state.state_data),
             is_closed=state.is_closed,
             version=self._versions.get(session_hash, 0),
+            fencing_token=self._fencing.get(session_hash, 0),
         )
 
     def __len__(self) -> int:
@@ -211,7 +257,7 @@ def resolve_session_store(
     blocks: Blocks | None = None,
     holder: StateHolder | None = None,
     **backend_kwargs: Any,
-) -> InProcessSessionStore:
+) -> SessionStore:
     """Resolve the configured store.
 
     Precedence, mirroring the repo's adapter convention: an explicit argument,
@@ -231,7 +277,7 @@ def resolve_session_store(
                 "The Redis session store needs a client. Pass `client=` or set "
                 "GRADIO_REDIS_URL so it can be created."
             )
-        return RedisSessionStore(client, **backend_kwargs)  # type: ignore[return-value]
+        return RedisSessionStore(client, **backend_kwargs)
 
     store_cls = _BUILTIN_STORES.get(name)
     if store_cls is None:
@@ -243,11 +289,6 @@ def resolve_session_store(
     if blocks is not None:
         return store_cls(blocks=blocks)  # type: ignore[call-arg]
     return store_cls()  # type: ignore[call-arg]
-
-
-def register_session_store(name: str, store_cls: type) -> None:
-    """Register an external backend under a name, for ``GRADIO_SESSION_STORE``."""
-    _BUILTIN_STORES[name.strip().lower()] = store_cls
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +403,19 @@ def encode_envelope(record: SessionRecord, closed_at: str | None = None) -> byte
         "session_hash": record.session_hash,
         "principal": record.principal,
         "version": record.version,
+        "fencing_token": record.fencing_token,
         "is_closed": record.is_closed,
-        "closed_at": closed_at,
+        "closed_at": (
+            closed_at
+            if closed_at is not None
+            else (
+                datetime.datetime.fromtimestamp(
+                    record.closed_at, tz=datetime.timezone.utc
+                ).isoformat()
+                if record.closed_at
+                else None
+            )
+        ),
         "state_data": {
             str(k): _encode_value(v, f"state_data[{k}]")
             for k, v in record.state_data.items()
@@ -395,8 +447,19 @@ def decode_envelope(raw: bytes) -> tuple[SessionRecord, str | None]:
         },
         is_closed=bool(payload.get("is_closed", False)),
         version=int(payload.get("version", 0)),
+        fencing_token=int(payload.get("fencing_token", 0)),
+        closed_at=_parse_closed_at(payload.get("closed_at")),
     )
     return record, payload.get("closed_at")
+
+
+def _parse_closed_at(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return 0.0
 
 
 class RedisSessionStore:
@@ -491,6 +554,7 @@ class RedisSessionStore:
         record: SessionRecord,
         expected_version: int,
         principal: str | None = None,
+        fencing_token: int | None = None,
     ) -> bool:
         key = self._key(record.session_hash)
         with self._client.pipeline() as pipe:
@@ -507,6 +571,17 @@ class RedisSessionStore:
                 ):
                     pipe.unwatch()
                     return False
+                # A superseded worker's late write carries a stale token.
+                if fencing_token is not None and fencing_token < current.fencing_token:
+                    pipe.unwatch()
+                    return False
+                if fencing_token is not None:
+                    record.fencing_token = fencing_token
+                # Stamp the close time once, so retention is measured from it.
+                if record.is_closed and not record.closed_at:
+                    record.closed_at = time.time()
+                elif not record.is_closed:
+                    record.closed_at = 0.0
                 record.version = expected_version + 1
                 pipe.multi()
                 pipe.set(key, self._seal(encode_envelope(record)))
@@ -526,9 +601,25 @@ class RedisSessionStore:
             return
         self._client.delete(self._key(session_hash))
 
-    def delete_all_expired_state(self) -> None:
-        # Expiry is Redis's own TTL; nothing to sweep here.
-        return None
+    def sweep(self, closed_retention: float = 3600.0) -> list[SessionRecord]:
+        now = time.time()
+        removed = []
+        for raw_key in self._client.scan_iter(match=self._match_pattern()):
+            try:
+                raw = self._client.get(raw_key)
+                if raw is None:
+                    continue
+                record, _ = decode_envelope(self._open(raw))
+            except SessionEnvelopeError:
+                continue
+            if (
+                record.is_closed
+                and record.closed_at
+                and now - record.closed_at > closed_retention
+            ):
+                self._client.delete(raw_key)
+                removed.append(record)
+        return removed
 
     def _touch(self, session_hash: str) -> None:
         if self.ttl_seconds:

@@ -17,6 +17,7 @@ With no store configured the in-process behavior is unchanged.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -24,6 +25,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 FILE_STORE_ENV_VAR = "GRADIO_FILE_STORE"
 
@@ -67,6 +70,9 @@ class FileStore(Protocol):
 
     def delete(self, key: str) -> None:
         """Remove a stored file."""
+
+    def list_records(self) -> list[FileRecord]:
+        """Every stored file with its ownership metadata, for orphan GC."""
 
 
 def _record(
@@ -119,6 +125,10 @@ class LocalFileStore:
     def delete(self, key):
         with self._lock:
             self._records.pop(key, None)
+
+    def list_records(self) -> list[FileRecord]:
+        with self._lock:
+            return list(self._records.values())
 
 
 class HfBucketFileStore:
@@ -190,7 +200,7 @@ class HfBucketFileStore:
     def resolve(self, key, principal):
         try:
             owner = self._owner_record(key)
-        except Exception:
+        except Exception:  # a missing or unreadable record is a miss, not an error
             return None
         if owner is None or owner.get("owner") != principal:
             return None
@@ -221,6 +231,38 @@ class HfBucketFileStore:
             delete=[self._object_key(key), self._owner_key(key)],
         )
 
+    def _owner_prefix(self) -> str:
+        return f"{self.prefix}/owners/{self.app_id}/"
+
+    def list_records(self) -> list[FileRecord]:
+        prefix = self._owner_prefix()
+        records = []
+        for entry in self._api().list_bucket_tree(
+            self.bucket, prefix=prefix, recursive=True
+        ):
+            if getattr(entry, "type", None) != "file" or not entry.path.endswith(
+                ".json"
+            ):
+                continue
+            key = entry.path[len(prefix) : -len(".json")]
+            try:
+                owner = self._owner_record(key)
+            except Exception:  # an unreadable sidecar is skipped, not fatal
+                logger.debug("file gc: unreadable owner record %r", key)
+                continue
+            if owner is None:
+                continue
+            records.append(
+                FileRecord(
+                    key=key,
+                    owner=owner.get("owner"),
+                    session_hash=owner.get("session_hash"),
+                    committed_at=owner.get("committed_at", 0.0),
+                    size=owner.get("size", 0),
+                )
+            )
+        return records
+
 
 def resolve_file_store(
     spec: str | None = None,
@@ -233,6 +275,6 @@ def resolve_file_store(
     back to the default rather than failing.
     """
     name = (spec or os.getenv(FILE_STORE_ENV_VAR) or "inprocess").strip().lower()
-    if name in ("hf", "hf-bucket", "hub", "bucket", "s3"):
+    if name in ("hf", "hf-bucket", "hub", "bucket"):
         return HfBucketFileStore(**backend_kwargs)
     return LocalFileStore()

@@ -3188,6 +3188,9 @@ def test_mount_gradio_app_args_match_launch_args():
         "i18n",
         "_app",
         "num_workers",
+        # A multi-replica deployment wires stores on the app it builds, not on
+        # an already-configured app being mounted.
+        "multi_replica",
     }
 
     missing_params = []

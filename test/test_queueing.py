@@ -595,3 +595,81 @@ class TestOwnEventStream:
             assert "left-early" not in demo._queue.pending_event_ids_session
         finally:
             demo.close()
+
+
+class TestGracefulDrain:
+    """U8: shutdown stops new work and lets running jobs finish within a window."""
+
+    @staticmethod
+    def _queue():
+        from gradio.queueing import Queue
+
+        with gr.Blocks() as demo:
+            gr.Button()
+        return Queue(
+            live_updates=False,
+            concurrency_count=1,
+            update_intervals=1.0,
+            max_size=None,
+            blocks=demo,
+        )
+
+    def test_running_job_finishes_within_the_drain_window(self):
+        async def scenario():
+            queue = self._queue()
+            finished = asyncio.Event()
+
+            async def job():
+                await asyncio.sleep(0.1)
+                finished.set()
+
+            task = asyncio.ensure_future(job())
+            queue._asyncio_tasks.add(task)
+            queue.close(drain=True, timeout=1.0)
+            assert queue.stopped is True
+
+            await queue.drain()
+
+            assert finished.is_set()
+            assert not task.cancelled()
+
+        asyncio.run(scenario())
+
+    def test_job_past_the_window_is_cancelled(self):
+        async def scenario():
+            queue = self._queue()
+            released = asyncio.Event()
+
+            async def job():
+                try:
+                    await asyncio.sleep(10)
+                finally:
+                    released.set()
+
+            task = asyncio.ensure_future(job())
+            queue._asyncio_tasks.add(task)
+            queue.close(drain=True, timeout=0.02)
+
+            await queue.drain()
+
+            assert released.is_set()
+            assert task.cancelled()
+
+        asyncio.run(scenario())
+
+    def test_default_close_still_cancels_immediately(self):
+        async def scenario():
+            queue = self._queue()
+
+            async def job():
+                await asyncio.sleep(10)
+
+            task = asyncio.ensure_future(job())
+            queue._asyncio_tasks.add(task)
+            queue.close()
+
+            await queue.drain()
+
+            assert task.cancelled()
+
+        asyncio.run(scenario())

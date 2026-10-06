@@ -103,6 +103,17 @@ class TestVersionedWrites:
         assert b.save(second, expected_version=second.version) is False
         assert a.resolve("s1", principal=None).state_data[0] == "from-a"
 
+    def test_superseded_worker_late_write_is_rejected(self, two_stores):
+        a, b = two_stores
+        record = a.create("s1", principal=None)
+        assert a.save(record, expected_version=0, fencing_token=10) is True
+        # A redelivered worker from before the takeover holds a lower token.
+        late = b.resolve("s1", principal=None)
+        assert late is not None
+        late.state_data = {0: "late"}
+        assert b.save(late, expected_version=late.version, fencing_token=4) is False
+        assert a.resolve("s1", principal=None).state_data == {}
+
     def test_watch_error_is_a_retryable_conflict(self, two_stores, monkeypatch):
         import redis
 
