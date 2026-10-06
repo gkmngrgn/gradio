@@ -19,10 +19,10 @@ Start Redis with the Redis-only compose file:
 docker compose -f test/multi-replica/docker-compose.yml up -d
 ```
 
-Launch the app (real Redis on `localhost:6379` by default, override with
-`GRADIO_REDIS_URL`):
+Launch the app (pointing at Redis with the single store variable):
 
 ```powershell
+$env:GRADIO_SESSION_STORE_URL = "redis://localhost:6379"
 python demo/multi_replica_counter/run.py
 ```
 

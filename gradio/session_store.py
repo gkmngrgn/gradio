@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from gradio.blocks import Blocks
 
 SESSION_STORE_ENV_VAR = "GRADIO_SESSION_STORE"
+SESSION_STORE_URL_ENV_VAR = "GRADIO_SESSION_STORE_URL"
 
 
 @dataclass
@@ -215,21 +216,43 @@ def resolve_session_store(
     """Resolve the configured store.
 
     Precedence, mirroring the repo's adapter convention: an explicit argument,
-    then ``GRADIO_SESSION_STORE``, then the in-process default. An unrecognized
-    value falls back to the default rather than failing, so a typo cannot take
-    an app down.
+    then ``GRADIO_SESSION_STORE_URL``, then ``GRADIO_SESSION_STORE``, then the
+    in-process default. A URL value (explicit or via the URL variable) selects
+    the backend from its scheme and builds the client automatically, so one
+    variable is the whole configuration. An unrecognized value falls back to
+    the default rather than failing, so a typo cannot take an app down.
 
     ``backend_kwargs`` are forwarded to the resolved backend. External backends
     are imported lazily, so the default path never touches their dependencies.
     """
-    name = (spec or os.getenv(SESSION_STORE_ENV_VAR) or "inprocess").strip().lower()
+    name = (
+        spec
+        or os.getenv(SESSION_STORE_URL_ENV_VAR)
+        or os.getenv(SESSION_STORE_ENV_VAR)
+        or "inprocess"
+    ).strip()
+
+    if "://" in name:
+        from urllib.parse import urlsplit
+
+        if urlsplit(name).scheme.lower() not in ("redis", "rediss", "unix"):
+            name = "inprocess"
+        else:
+            import redis  # lazy: the default install never depends on it
+
+            backend_kwargs.setdefault(
+                "client", redis.Redis.from_url(name, decode_responses=False)
+            )
+            name = "redis"
+
+    name = name.lower()
 
     if name in ("redis", "redis-session"):
         client = backend_kwargs.pop("client", None) or backend_kwargs.pop("redis", None)
         if client is None:
             raise RuntimeError(
-                "The Redis session store needs a client. Pass `client=` or set "
-                "GRADIO_REDIS_URL so it can be created."
+                "The Redis session store needs a client. Pass `client=`, a "
+                "`redis://` URL, or set GRADIO_SESSION_STORE_URL."
             )
         return RedisSessionStore(client, **backend_kwargs)  # type: ignore[return-value]
 

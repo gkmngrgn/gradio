@@ -33,6 +33,7 @@ def _store() -> InProcessSessionStore:
 class TestDefaultIsInProcess:
     def test_no_configuration_resolves_in_process(self, monkeypatch):
         monkeypatch.delenv("GRADIO_SESSION_STORE", raising=False)
+        monkeypatch.delenv("GRADIO_SESSION_STORE_URL", raising=False)
         store = resolve_session_store()
         assert isinstance(store, InProcessSessionStore)
 
@@ -41,6 +42,7 @@ class TestDefaultIsInProcess:
 
     def test_unknown_backend_name_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("GRADIO_SESSION_STORE", "not-a-real-backend")
+        monkeypatch.delenv("GRADIO_SESSION_STORE_URL", raising=False)
         store = resolve_session_store()
         assert isinstance(store, InProcessSessionStore)
 
@@ -148,6 +150,37 @@ class TestRetiresWithStateHolder:
         store = InProcessSessionStore.from_holder(holder)
         record = store.create("s1", principal=None)
         assert record.session_hash == "s1"
+
+
+class TestUrlResolution:
+    def test_url_env_resolves_redis_without_a_server(self, monkeypatch):
+        pytest.importorskip("redis")
+        from gradio.session_store import RedisSessionStore
+
+        monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "redis://localhost:6379")
+        monkeypatch.delenv("GRADIO_SESSION_STORE", raising=False)
+        assert isinstance(resolve_session_store(), RedisSessionStore)
+
+    def test_explicit_url_spec_works(self):
+        pytest.importorskip("redis")
+        from gradio.session_store import RedisSessionStore
+
+        store = resolve_session_store("redis://localhost:6379/1")
+        assert isinstance(store, RedisSessionStore)
+
+    def test_explicit_name_wins_over_url_env(self, monkeypatch):
+        monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "redis://localhost:6379")
+        assert isinstance(resolve_session_store("inprocess"), InProcessSessionStore)
+
+    def test_unknown_scheme_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "nonsense://localhost:1")
+        monkeypatch.delenv("GRADIO_SESSION_STORE", raising=False)
+        assert isinstance(resolve_session_store(), InProcessSessionStore)
+
+    def test_redis_name_without_client_still_fails(self, monkeypatch):
+        monkeypatch.delenv("GRADIO_SESSION_STORE_URL", raising=False)
+        with pytest.raises(RuntimeError):
+            resolve_session_store("redis")
 
 
 if __name__ == "__main__":

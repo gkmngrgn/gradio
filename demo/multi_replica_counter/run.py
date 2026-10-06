@@ -17,20 +17,20 @@ Run:
 import os
 
 import gradio as gr
+from gradio.session_store import resolve_session_store
 
 
 def get_store():
-    try:
-        import redis
-    except ImportError as err:
-        raise RuntimeError(
-            "This demo needs the 'redis' package: pip install 'redis>=5.0,<9.0'."
-        ) from err
-    from gradio.session_store import RedisSessionStore
-
-    url = os.getenv("GRADIO_REDIS_URL", "redis://localhost:6379")
-    client = redis.Redis.from_url(url, decode_responses=False)
-    return RedisSessionStore(client, app_id="demo-counter")
+    # One variable is the whole configuration: the URL scheme selects the
+    # backend and the client is built automatically. Fail fast when it is
+    # missing -- silently falling back to the in-process default would make
+    # this demo prove nothing.
+    if not os.getenv("GRADIO_SESSION_STORE_URL"):
+        raise SystemExit(
+            "Set GRADIO_SESSION_STORE_URL first, e.g. "
+            "GRADIO_SESSION_STORE_URL=redis://localhost:6379"
+        )
+    return resolve_session_store(app_id="demo-counter")
 
 
 def turn(room):
