@@ -1,0 +1,4 @@
+# Multi-replica mode: session state and the durable work queue need Redis.
+# The object store (Hugging Face Storage Buckets) uses huggingface_hub, which is
+# already a core dependency, so it is not listed here.
+redis>=5.0,<9.0
