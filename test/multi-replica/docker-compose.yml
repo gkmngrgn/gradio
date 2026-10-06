@@ -1,0 +1,20 @@
+# Tier B: real Redis for the multi-replica integration tests.
+#
+# The object store is Hugging Face Storage Buckets (via huggingface_hub), so it
+# needs no local container; unit tests use the in-memory FakeHub from
+# test/test_history.py, and integration coverage uses a real bucket token.
+#
+#   docker compose -f test/multi-replica/docker-compose.yml up -d
+#   GRADIO_TEST_REDIS_URL=redis://localhost:6379 pytest -m integration
+#   docker compose -f test/multi-replica/docker-compose.yml down
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
