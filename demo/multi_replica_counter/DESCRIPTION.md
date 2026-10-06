@@ -14,7 +14,9 @@ on that branch.
 
 ## Run
 
-Start Redis (Docker daemon up):
+Start Redis only -- that compose file holds a single Redis service, so
+no `--scale` applies here (the 10-app scaling lives in
+`docker-compose.yml` next to this demo):
 
 ```powershell
 docker compose -f test/multi-replica/docker-compose.yml up -d
