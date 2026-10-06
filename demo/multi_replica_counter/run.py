@@ -44,6 +44,13 @@ def turn(room):
     raise gr.Error("Concurrent update, please try again.")
 
 
+def show(room):
+    room = (room or "lobby").strip() or "lobby"
+    record = get_store().resolve(room, principal=None)
+    count = record.state_data.get(0, 0) if record is not None else 0
+    return count, f"room={room}"
+
+
 with gr.Blocks() as demo:
     gr.Markdown("## Shared counter (Redis-backed session store)")
     room = gr.Textbox(label="room", value="lobby")
@@ -51,6 +58,7 @@ with gr.Blocks() as demo:
     label = gr.Textbox(label="where", value="")
     btn = gr.Button("turn")
     btn.click(turn, room, [count, label], api_name="turn")
+    demo.load(show, room, [count, label])
 
 if __name__ == "__main__":
     demo.launch()
