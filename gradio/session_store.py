@@ -33,7 +33,6 @@ from gradio.state_holder import StateHolder
 if TYPE_CHECKING:
     from gradio.blocks import Blocks
 
-SESSION_STORE_ENV_VAR = "GRADIO_SESSION_STORE"
 SESSION_STORE_URL_ENV_VAR = "GRADIO_SESSION_STORE_URL"
 
 
@@ -215,22 +214,17 @@ def resolve_session_store(
 ) -> InProcessSessionStore:
     """Resolve the configured store.
 
-    Precedence, mirroring the repo's adapter convention: an explicit argument,
-    then ``GRADIO_SESSION_STORE_URL``, then ``GRADIO_SESSION_STORE``, then the
-    in-process default. A URL value (explicit or via the URL variable) selects
-    the backend from its scheme and builds the client automatically, so one
-    variable is the whole configuration. An unrecognized value falls back to
-    the default rather than failing, so a typo cannot take an app down.
+    Precedence: an explicit argument, then ``GRADIO_SESSION_STORE_URL``,
+    then the in-process default. A URL value (explicit or via the variable)
+    selects the backend from its scheme and builds the client automatically,
+    so one variable is the whole configuration. An unrecognized value falls
+    back to the default rather than failing, so a typo cannot take an app
+    down.
 
     ``backend_kwargs`` are forwarded to the resolved backend. External backends
     are imported lazily, so the default path never touches their dependencies.
     """
-    name = (
-        spec
-        or os.getenv(SESSION_STORE_URL_ENV_VAR)
-        or os.getenv(SESSION_STORE_ENV_VAR)
-        or "inprocess"
-    ).strip()
+    name = (spec or os.getenv(SESSION_STORE_URL_ENV_VAR) or "inprocess").strip()
 
     if "://" in name:
         from urllib.parse import urlsplit
@@ -269,7 +263,7 @@ def resolve_session_store(
 
 
 def register_session_store(name: str, store_cls: type) -> None:
-    """Register an external backend under a name, for ``GRADIO_SESSION_STORE``."""
+    """Register an external backend under a name, for the ``spec`` argument."""
     _BUILTIN_STORES[name.strip().lower()] = store_cls
 
 

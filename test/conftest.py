@@ -49,18 +49,18 @@ def real_redis_client():
 
     Start one with
     ``docker compose -f test/multi-replica/docker-compose.yml up -d`` and set
-    ``GRADIO_TEST_REDIS_URL=redis://localhost:6379``. Env-gated so the default
+    ``GRADIO_SESSION_STORE_URL=redis://localhost:6379``. Env-gated so the default
     test run needs no infrastructure.
     """
-    url = os.getenv("GRADIO_TEST_REDIS_URL")
+    url = os.getenv("GRADIO_SESSION_STORE_URL")
     if not url:
-        pytest.skip("set GRADIO_TEST_REDIS_URL to run Redis integration tests")
+        pytest.skip("set GRADIO_SESSION_STORE_URL to run Redis integration tests")
     redis = pytest.importorskip("redis")
-    client = redis.Redis.from_url(url, decode_responses=False)
     try:
+        client = redis.Redis.from_url(url, decode_responses=False)
         client.ping()
     except Exception as exc:
-        pytest.skip(f"GRADIO_TEST_REDIS_URL is not reachable: {exc}")
+        pytest.skip(f"GRADIO_SESSION_STORE_URL is not reachable: {exc}")
     yield client
     client.flushdb()
     client.close()

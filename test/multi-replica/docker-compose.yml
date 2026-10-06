@@ -5,7 +5,7 @@
 # test/test_history.py, and integration coverage uses a real bucket token.
 #
 #   docker compose -f test/multi-replica/docker-compose.yml up -d
-#   GRADIO_TEST_REDIS_URL=redis://localhost:6379 pytest -m integration
+#   GRADIO_SESSION_STORE_URL=redis://localhost:6379 pytest -m integration
 #   docker compose -f test/multi-replica/docker-compose.yml down
 services:
   redis:

@@ -32,7 +32,6 @@ def _store() -> InProcessSessionStore:
 
 class TestDefaultIsInProcess:
     def test_no_configuration_resolves_in_process(self, monkeypatch):
-        monkeypatch.delenv("GRADIO_SESSION_STORE", raising=False)
         monkeypatch.delenv("GRADIO_SESSION_STORE_URL", raising=False)
         store = resolve_session_store()
         assert isinstance(store, InProcessSessionStore)
@@ -41,9 +40,8 @@ class TestDefaultIsInProcess:
         assert isinstance(_store(), SessionStore)
 
     def test_unknown_backend_name_falls_back_to_default(self, monkeypatch):
-        monkeypatch.setenv("GRADIO_SESSION_STORE", "not-a-real-backend")
         monkeypatch.delenv("GRADIO_SESSION_STORE_URL", raising=False)
-        store = resolve_session_store()
+        store = resolve_session_store("not-a-real-backend")
         assert isinstance(store, InProcessSessionStore)
 
 
@@ -158,7 +156,6 @@ class TestUrlResolution:
         from gradio.session_store import RedisSessionStore
 
         monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "redis://localhost:6379")
-        monkeypatch.delenv("GRADIO_SESSION_STORE", raising=False)
         assert isinstance(resolve_session_store(), RedisSessionStore)
 
     def test_explicit_url_spec_works(self):
@@ -174,7 +171,6 @@ class TestUrlResolution:
 
     def test_unknown_scheme_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "nonsense://localhost:1")
-        monkeypatch.delenv("GRADIO_SESSION_STORE", raising=False)
         assert isinstance(resolve_session_store(), InProcessSessionStore)
 
     def test_redis_name_without_client_still_fails(self, monkeypatch):

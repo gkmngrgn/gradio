@@ -212,9 +212,8 @@ class TestNamespace:
 
 
 class TestResolution:
-    def test_resolve_registers_redis_backend(self, monkeypatch, redis_client):
-        monkeypatch.setenv("GRADIO_SESSION_STORE", "redis")
-        store = resolve_session_store(client=redis_client, app_id="app-1")
+    def test_resolve_registers_redis_backend(self, redis_client):
+        store = resolve_session_store("redis", client=redis_client, app_id="app-1")
         assert isinstance(store, RedisSessionStore)
 
 
