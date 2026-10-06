@@ -225,7 +225,7 @@ def test_cross_replica_against_real_redis(real_redis_client):
     b = RedisSessionStore(real_redis_client, app_id="integration")
     record = a.create("s1", principal="alice")
     record.state_data[0] = {"n": 1}
-    assert a.save(record, record.version) is True
+    assert a.save(record, record.version, principal="alice") is True
 
     seen = b.resolve("s1", principal="alice")
     assert seen is not None
