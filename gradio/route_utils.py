@@ -280,10 +280,20 @@ class FnIndexInferError(Exception):
     pass
 
 
-def get_fn(blocks: Blocks, api_name: str | None, body: PredictBody) -> BlockFunction:
+def get_fn(
+    blocks: Blocks,
+    api_name: str | None,
+    body: PredictBody,
+    principal: str | None = None,
+) -> BlockFunction:
     if body.session_hash:
-        session_state = blocks.state_holder[body.session_hash]
-        fns = session_state.blocks_config.fns
+        # On the in-process path this auto-creates like the holder always did;
+        # with an external store a miss (or another principal's hash) stays a
+        # miss and falls back to the app's own fn table rather than minting.
+        session_state = blocks.get_session_state(
+            body.session_hash, principal, create=blocks.session_store is None
+        )
+        fns = session_state.blocks_config.fns if session_state else blocks.fns
     else:
         fns = blocks.fns
 
@@ -332,11 +342,23 @@ def compile_gr_request(
     return gr_request
 
 
-def restore_session_state(app: App, body: PredictBodyInternal):
+def restore_session_state(
+    app: App, body: PredictBodyInternal, principal: str | None = None
+):
     event_id = body.event_id
     session_hash = getattr(body, "session_hash", None)
     if session_hash is not None:
-        session_state = app.state_holder[session_hash]
+        blocks = app.get_blocks()
+        if blocks.session_store is not None:
+            session_state = blocks.get_session_state(
+                session_hash, principal, create=True
+            )
+            if session_state is None:
+                raise ValueError(
+                    "Session not found, or it belongs to another principal."
+                )
+        else:
+            session_state = app.state_holder[session_hash]
         # The should_reset set keeps track of the fn_indices
         # that have been cancelled. When a job is cancelled,
         # the /reset route will mark the jobs as having been reset.
@@ -350,10 +372,26 @@ def restore_session_state(app: App, body: PredictBodyInternal):
         else:
             iterator = app.iterators.get(event_id)
     else:
+        # No session identity: a transient state, never persisted behind the store.
         session_state = SessionState(app.get_blocks())
         iterator = None
 
     return session_state, iterator
+
+
+def principal_from_request(
+    request: Union[Request, list[Request], None],
+) -> str | None:
+    """The authenticated username carried on a request, if any.
+
+    When ``auth=`` is set the principal is the username; otherwise it is
+    ``None`` and the client session identity is the only owner. A call site that
+    cannot name a principal passes ``None`` explicitly rather than resolving by
+    hash alone.
+    """
+    if isinstance(request, list):
+        request = request[0] if request else None
+    return getattr(request, "username", None)
 
 
 def prepare_event_data(
@@ -394,7 +432,10 @@ async def call_process_api(
     fn: BlockFunction,
     root_path: str,
 ):
-    session_state, iterator = restore_session_state(app=app, body=body)
+    principal = principal_from_request(gr_request)
+    session_state, iterator = restore_session_state(
+        app=app, body=body, principal=principal
+    )
 
     event_data = prepare_event_data(session_state.blocks_config, body)
     event_id = body.event_id
@@ -1146,7 +1187,8 @@ async def _lifespan_handler(
 async def _delete_state(app: App):
     """Delete all expired state every second."""
     while True:
-        app.state_holder.delete_all_expired_state()
+        blocks = app.get_blocks()
+        (blocks.session_store or blocks.state_holder).delete_all_expired_state()
         await asyncio.sleep(1)
 
 
