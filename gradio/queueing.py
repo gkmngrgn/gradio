@@ -483,7 +483,7 @@ class Queue:
         except KeyError as e:
             self.pending_messages_per_event.pop(event._id, None)
             raise KeyError(
-                "Event not found in queue. If you are deploying this Gradio app with multiple replicas, please enable stickiness to ensure that all requests from the same user are routed to the same instance."
+                "Event not found in queue. If you are deploying this Gradio app with multiple replicas without session affinity, enable multi-replica mode (see the Docker and Modal deployment guides); otherwise enable stickiness so all requests from the same user reach the same instance."
             ) from e
         event_queue.queue.append(event)
         self.event_analytics[event._id] = {

@@ -129,6 +129,7 @@ class TestVersionedWrites:
 
         assert store.save(record, expected_version=record.version) is False
 
+
 class TestAtomicCreation:
     def test_resolve_then_create_yields_one_session(self, two_stores):
         a, b = two_stores
