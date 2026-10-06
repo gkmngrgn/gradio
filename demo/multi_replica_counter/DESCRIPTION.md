@@ -1,32 +1,20 @@
-# Shared counter demo
+# Session counter demo
 
-A real Gradio app whose counter lives in the Redis-backed session store
-(group 1 seam) instead of process memory. Open two browser tabs, type the
-same room name in both, and turns in either tab advance the same counter.
+A genuine Gradio session counter: each tab holds its own `gr.State`,
+turns advance it, refresh resets it. On this branch the seam behind it
+is the in-process default, so behavior matches upstream session demos.
 
-## Scope
-
-The app resolves the store explicitly: there is no
-`launch(multi_replica=...)` on this branch yet -- the launch preset, and
-the 10-replica compose rig that exercises it, arrive with group 5 on
-`feat/multi-replica-session-durability`.
+The point of this file is forward compatibility: unchanged, it is the
+app the 10-replica rig on `feat/multi-replica-session-durability`
+serves from shared storage, where the same per-tab session stays
+consistent across replicas with no affinity.
 
 ## Run
 
-Start Redis with the Redis-only compose file:
-
 ```powershell
-docker compose -f test/multi-replica/docker-compose.yml up -d
-```
-
-Launch the app. With no configuration it uses the in-process default;
-point `GRADIO_SESSION_STORE_URL` at Redis to share state across processes:
-
-```powershell
-python demo/multi_replica_counter/run.py
-$env:GRADIO_SESSION_STORE_URL = "redis://localhost:6379"
 python demo/multi_replica_counter/run.py
 ```
 
-Open http://127.0.0.1:7860 in two tabs, enter the same room in both, and
-alternate Turn clicks: the count climbs 1, 2, 3... regardless of tab.
+Open http://127.0.0.1:7860 in two tabs: each tab counts independently
+1, 2, 3... Refreshing a tab resets its counter -- per-tab sessions are
+untouched by this stack by design.
