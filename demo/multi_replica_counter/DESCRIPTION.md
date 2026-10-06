@@ -1,14 +1,14 @@
-# Multi-replica counter demo
+# Shared counter demo
 
-Proves the session-store seam (group 1): two store instances stand in for
-two replicas behind a round-robin load balancer. Turns alternate between
-them; the counter must still come out exactly 1..10 with no affinity.
+A real Gradio app whose counter lives in the Redis-backed session store
+(group 1 seam) instead of process memory. Open two browser tabs, type the
+same room name in both, and turns in either tab advance the same counter.
 
 ## Scope
 
-This demo drives the seam API directly. There is no
-`launch(multi_replica=...)` here yet -- the launch preset, and the
-10-replica compose rig that exercises it, arrive with group 5 on
+The app resolves the store explicitly: there is no
+`launch(multi_replica=...)` on this branch yet -- the launch preset, and
+the 10-replica compose rig that exercises it, arrive with group 5 on
 `feat/multi-replica-session-durability`.
 
 ## Run
@@ -19,22 +19,12 @@ Start Redis with the Redis-only compose file:
 docker compose -f test/multi-replica/docker-compose.yml up -d
 ```
 
-Run the demo (real Redis on `localhost:6379` by default, override with
-`GRADIO_TEST_REDIS_URL`):
+Launch the app (real Redis on `localhost:6379` by default, override with
+`GRADIO_REDIS_URL`):
 
 ```powershell
 python demo/multi_replica_counter/run.py
 ```
 
-Expected output:
-
-```
-replica A: count=1
-replica B: count=2
-...
-replica B: count=10
-OK: 10 turns across 2 replicas, counter 1..10, no affinity
-```
-
-The demo deletes and recreates its session on every run, so reruns are
-deterministic.
+Open http://127.0.0.1:7860 in two tabs, enter the same room in both, and
+alternate Turn clicks: the count climbs 1, 2, 3... regardless of tab.

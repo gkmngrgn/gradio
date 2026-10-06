@@ -1,10 +1,12 @@
-"""Counter demo for the session-store seam (group 1).
+"""Shared counter demo for the session-store seam (group 1).
 
-No `launch(multi_replica=...)` here yet -- that arrives with the preset in
-group 5. This demo drives the seam API directly: two store instances stand
-in for two replicas, and turns alternate between them the way a
-round-robin load balancer would distribute them.
+A real Gradio app whose counter lives in the Redis-backed session store
+instead of process memory. Open two tabs, type the same room name in both,
+and turns in either tab advance the same counter -- the store, not the
+process, owns the state.
 
+There is no `launch(multi_replica=...)` on this branch yet (it arrives
+with the preset in group 5), so the app resolves the store explicitly.
 Needs a Redis server (default: localhost:6379):
     docker compose -f test/multi-replica/docker-compose.yml up -d
 
@@ -13,46 +15,42 @@ Run:
 """
 
 import os
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
-import redis
-
-from gradio.session_store import RedisSessionStore
+import gradio as gr
 
 
-def fail(message):
-    print(f"FAILED: {message}")
-    raise SystemExit(1)
+def get_store():
+    try:
+        import redis
+    except ImportError as err:
+        raise RuntimeError(
+            "This demo needs the 'redis' package: pip install 'redis>=5.0,<9.0'."
+        ) from err
+    from gradio.session_store import RedisSessionStore
 
-
-def turn(store, session_hash, principal, label):
-    record = store.resolve(session_hash, principal=principal)
-    if record is None:
-        fail(f"{label} cannot see the session")
-    record.state_data[0] = record.state_data.get(0, 0) + 1
-    if store.save(record, record.version, principal=principal) is not True:
-        fail(f"{label} lost a versioned write")
-    print(f"{label}: count={record.state_data[0]}")
-    return record.state_data[0]
-
-
-def main() -> None:
-    url = os.getenv("GRADIO_TEST_REDIS_URL", "redis://localhost:6379")
+    url = os.getenv("GRADIO_REDIS_URL", "redis://localhost:6379")
     client = redis.Redis.from_url(url, decode_responses=False)
+    return RedisSessionStore(client, app_id="demo-counter")
 
-    replica_a = RedisSessionStore(client, app_id="demo-counter")
-    replica_b = RedisSessionStore(client, app_id="demo-counter")
 
-    replica_a.delete("counter-1", principal="alice")
-    replica_a.create("counter-1", principal="alice")
-    pairs = [(replica_a, "replica A"), (replica_b, "replica B")] * 5
-    counts = [turn(s, "counter-1", "alice", name) for s, name in pairs]
-    if counts != list(range(1, 11)):
-        fail(f"state diverged: {counts}")
-    print("OK: 10 turns across 2 replicas, counter 1..10, no affinity")
+def turn(room):
+    room = (room or "lobby").strip() or "lobby"
+    store = get_store()
+    for _ in range(5):
+        record = store.create(room, principal=None)
+        record.state_data[0] = record.state_data.get(0, 0) + 1
+        if store.save(record, record.version, principal=None) is True:
+            return record.state_data[0], f"room={room}"
+    raise gr.Error("Concurrent update, please try again.")
 
+
+with gr.Blocks() as demo:
+    gr.Markdown("## Shared counter (Redis-backed session store)")
+    room = gr.Textbox(label="room", value="lobby")
+    count = gr.Number(label="count", value=0)
+    label = gr.Textbox(label="where", value="")
+    btn = gr.Button("turn")
+    btn.click(turn, room, [count, label], api_name="turn")
 
 if __name__ == "__main__":
-    main()
+    demo.launch()
