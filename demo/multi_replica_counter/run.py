@@ -20,17 +20,22 @@ import gradio as gr
 from gradio.session_store import resolve_session_store
 
 
+_store_holder: dict = {}
+
+
 def get_store():
-    # One variable is the whole configuration: the URL scheme selects the
-    # backend and the client is built automatically. Fail fast when it is
-    # missing -- silently falling back to the in-process default would make
-    # this demo prove nothing.
-    if not os.getenv("GRADIO_SESSION_STORE_URL"):
-        raise SystemExit(
-            "Set GRADIO_SESSION_STORE_URL first, e.g. "
-            "GRADIO_SESSION_STORE_URL=redis://localhost:6379"
-        )
-    return resolve_session_store(app_id="demo-counter")
+    # One process-wide instance bound to this app: the in-process backend
+    # mints sessions from the app's Blocks, so it needs the binding (the
+    # Redis backend ignores it -- the receiving replica rebuilds state
+    # from its own app).
+    if "store" not in _store_holder:
+        if os.getenv("GRADIO_SESSION_STORE_URL"):
+            _store_holder["store"] = resolve_session_store(app_id="demo-counter")
+        else:
+            _store_holder["store"] = resolve_session_store(
+                blocks=demo, app_id="demo-counter"
+            )
+    return _store_holder["store"]
 
 
 def turn(room):
