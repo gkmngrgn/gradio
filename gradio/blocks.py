@@ -77,6 +77,7 @@ from gradio.exceptions import (
     ServerFailedToStartError,
     ShareCertificateWriteError,
 )
+from gradio.file_store import FileRecord, FileStore
 from gradio.helpers import create_tracker, skip, special_args
 from gradio.i18n import I18n, I18nData
 from gradio.node_server import start_node_server
@@ -1396,6 +1397,10 @@ class Blocks(BlockContext, BlocksEvents, metaclass=BlocksMeta):
         # this process's `state_holder`. Left None by default, so the in-process
         # path is unchanged until an external store opts in (R12).
         self.session_store: SessionStore | None = None
+        # When set, uploaded and generated files are committed to this store
+        # before the upload is acknowledged, and served from it with an
+        # ownership check. Left None so the local temp path is unchanged (R12).
+        self.file_store: FileStore | None = None
         self.custom_mount_path: str | None = None
         self.pwa = False
         self.mcp_server = False
@@ -2960,6 +2965,27 @@ Received inputs:
                     f"session store. {error}"
                 )
         return error
+
+    def store_upload(
+        self,
+        local_path: str,
+        key: str,
+        *,
+        owner: str | None,
+        session_hash: str | None = None,
+    ) -> FileRecord | None:
+        """Commit an uploaded file and its ownership before acknowledging it."""
+        store = self.file_store
+        if store is None:
+            return None
+        return store.put(local_path, key, owner=owner, session_hash=session_hash)
+
+    def fetch_file(self, key: str, principal: str | None) -> str | None:
+        """A local path for a stored file, only if ``principal`` owns it."""
+        store = self.file_store
+        if store is None:
+            return None
+        return store.materialize(key, principal)
 
     def get_state_ids_to_track(
         self, block_fn: BlockFunction, state: SessionState | None
