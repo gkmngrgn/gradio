@@ -14,13 +14,17 @@ on that branch.
 
 ## Run
 
-Start Redis only -- that compose file holds a single Redis service, so
-no `--scale` applies here (the 10-app scaling lives in
-`docker-compose.yml` next to this demo):
+This demo needs only Redis, so start the Redis-only compose file (it
+defines a single `redis` service -- `--scale` does not apply to it):
 
 ```powershell
 docker compose -f test/multi-replica/docker-compose.yml up -d
 ```
+
+The `docker-compose.yml` next to this demo is the full 10-app rig
+(Redis + 10 replicas + round-robin nginx, `--scale app=10`). It only
+runs on `feat/multi-replica-session-durability`, where the app serves
+HTTP; here it is parked for reference.
 
 Run the demo (real Redis on `localhost:6379` by default, override with
 `GRADIO_TEST_REDIS_URL`):
