@@ -3912,3 +3912,113 @@ class TestRequestScopedSessionResolution:
         first.state_data[0] = "kept"
         assert demo.get_session_state("h").state_data[0] == "kept"
         assert demo.save_session_state(first, "h") is True
+
+
+class TestCrossReplicaAuth:
+    """U6: a login on one replica is recognized on another."""
+
+    def test_token_verifies_on_a_second_instance(self):
+        from gradio.routes import SignedTokenAuth
+
+        alice = SignedTokenAuth("shared-secret")
+        bob = SignedTokenAuth("shared-secret")
+        assert bob.verify(alice.mint("alice")) == "alice"
+
+    def test_tampered_or_wrong_key_token_is_rejected(self):
+        from gradio.routes import SignedTokenAuth
+
+        auth = SignedTokenAuth("shared-secret")
+        token = auth.mint("alice")
+        assert auth.verify(token + "x") is None
+        assert auth.verify(token[:-1]) is None
+        assert SignedTokenAuth("other-secret").verify(token) is None
+        assert auth.verify(None) is None
+
+    def test_expired_token_is_rejected(self):
+        from gradio.routes import SignedTokenAuth
+
+        assert (
+            SignedTokenAuth("shared-secret", ttl=-1).verify(
+                SignedTokenAuth("shared-secret", ttl=-1).mint("alice")
+            )
+            is None
+        )
+
+    def test_logout_propagates_through_shared_revocations(self):
+        from gradio.routes import SignedTokenAuth
+
+        shared: set[str] = set()
+        alice = SignedTokenAuth("shared-secret", revocations=shared)
+        bob = SignedTokenAuth("shared-secret", revocations=shared)
+        token = alice.mint("alice")
+        assert bob.verify(token) == "alice"
+
+        alice.revoke(token)
+        assert bob.verify(token) is None
+
+    def test_default_app_keeps_the_process_local_path(self, monkeypatch):
+        monkeypatch.delenv("GRADIO_AUTH_SECRET", raising=False)
+        with gr.Blocks() as demo:
+            gr.Textbox()
+        app, _, _ = demo.launch(prevent_thread_lock=True)
+        try:
+            assert app.signed_auth is None
+            assert app.tokens == {}
+        finally:
+            demo.close()
+
+    def test_auth_secret_env_alone_does_not_change_default_auth(self, monkeypatch):
+        monkeypatch.setenv("GRADIO_AUTH_SECRET", "secret")
+        with gr.Blocks() as demo:
+            gr.Textbox()
+        app, _, _ = demo.launch(prevent_thread_lock=True, auth=[("alice", "pw")])
+        try:
+            assert app.signed_auth is None
+            assert app.tokens == {}
+        finally:
+            demo.close()
+
+    def test_signed_login_round_trip_and_cookie_trust(self, monkeypatch):
+        monkeypatch.delenv("GRADIO_AUTH_SECRET", raising=False)
+        with gr.Blocks() as demo:
+            gr.Textbox()
+        demo.auth_secret = "s3cret"
+        app, _, _ = demo.launch(prevent_thread_lock=True, auth=[("alice", "pw")])
+        try:
+            assert app.signed_auth is not None
+            client = TestClient(app)
+            response = client.post(
+                "/login", data={"username": "alice", "password": "pw"}
+            )
+            assert response.status_code == 200
+            # Signed mode does not populate the process-local token map.
+            assert app.tokens == {}
+
+            token = app.signed_auth.mint("alice")
+            secure = f"access-token-{app.cookie_id}"
+            unsecure = f"access-token-unsecure-{app.cookie_id}"
+            check = "/gradio_api/login_check"
+
+            # The unsecure cookie is lower trust and must not authenticate.
+            client.cookies.clear()
+            client.cookies.set(unsecure, token)
+            assert client.get(check).status_code == 401
+
+            client.cookies.clear()
+            client.cookies.set(secure, token)
+            assert client.get(check).status_code == 200
+
+            # A tampered secure token is rejected.
+            client.cookies.clear()
+            client.cookies.set(secure, token + "x")
+            assert client.get(check).status_code == 401
+
+            # Logout revokes the presented token server-side, for every replica.
+            client.cookies.clear()
+            client.cookies.set(secure, token)
+            client.get("/logout")
+            client.cookies.clear()
+            client.cookies.set(secure, token)
+            assert client.get(check).status_code == 401
+        finally:
+            demo.close()
