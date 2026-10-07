@@ -539,7 +539,7 @@ class RedisSessionStore:
                 raise SessionEnvelopeError(f"Failed to save session: {err}") from err
 
     def delete(self, session_hash: str, principal: str | None = None) -> None:
-        if principal is not None and not self._owns(session_hash, principal):
+        if not self._owns(session_hash, principal):
             return
         self._client.delete(self._key(session_hash))
 

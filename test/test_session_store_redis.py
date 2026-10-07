@@ -81,6 +81,18 @@ class TestAuthorization:
         a.create("s1", principal="alice")
         assert b.resolve("s1", principal="alice") is not None
 
+    def test_anonymous_delete_of_owned_session_is_refused(self, two_stores):
+        a, b = two_stores
+        a.create("s1", principal="alice")
+        b.delete("s1", principal=None)
+        assert b.contains("s1", principal="alice") is True
+
+    def test_owner_delete_removes_session(self, two_stores):
+        a, b = two_stores
+        a.create("s1", principal="alice")
+        b.delete("s1", principal="alice")
+        assert b.contains("s1", principal="alice") is False
+
 
 class TestVersionedWrites:
     def test_stale_version_is_rejected(self, two_stores):
