@@ -3884,6 +3884,39 @@ class TestRequestScopedSessionResolution:
         assert demo.get_session_state("h", "bob", create=False) is None
         assert demo.get_session_state("h", "alice") is not None
 
+    def test_get_fn_falls_back_to_app_fns_for_foreign_hash(self):
+        from gradio.data_classes import PredictBody
+        from gradio.route_utils import get_fn
+
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+        demo.session_store.create("h", principal="alice")
+
+        body = PredictBody(session_hash="h", data=[], fn_index=0)
+        assert (
+            get_fn(blocks=demo, api_name=None, body=body, principal="bob")
+            is demo.fns[0]
+        )
+
+    def test_restore_session_state_refuses_foreign_principal(self):
+        import asyncio
+
+        from gradio import route_utils, routes
+        from gradio.data_classes import PredictBodyInternal
+
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+        demo.session_store.create("h", principal="alice")
+        app = routes.App.create_app(demo)
+
+        body = PredictBodyInternal(session_hash="h", data=[])
+        with pytest.raises(ValueError, match="another principal"):
+            asyncio.run(
+                route_utils.restore_session_state(app=app, body=body, principal="bob")
+            )
+
     def test_session_close_persists_for_the_external_path(self):
         client = self._client()
         demo, _ = self._demo()

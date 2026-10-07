@@ -105,6 +105,57 @@ class TestSerializationFailure:
         assert stored.state_data[state._id] == "kept"
 
 
+class TestConcurrentMerge:
+    """Two turns racing on one session merge per key; close sticks."""
+
+    @staticmethod
+    def _demo():
+        with gr.Blocks() as demo:
+            gr.State(0)
+        return demo
+
+    @staticmethod
+    def _store():
+        return RedisSessionStore(
+            fakeredis.FakeRedis(decode_responses=False), app_id="app-1"
+        )
+
+    def _seeded(self, demo, data):
+        seed = demo.get_session_state("s", principal=None, create=True)
+        seed.state_data.update(data)
+        assert demo.save_session_state(seed, "s", principal=None) is True
+
+    def test_deleted_key_stays_deleted_on_conflict(self):
+        demo = self._demo()
+        demo.session_store = self._store()
+        self._seeded(demo, {0: "a", 1: "a"})
+        turn_a = demo.get_session_state("s", principal=None)
+        turn_b = demo.get_session_state("s", principal=None)
+        del turn_a.state_data[0]
+        turn_b.state_data[1] = "b"
+        assert demo.save_session_state(turn_a, "s", principal=None) is True
+        assert demo.save_session_state(turn_b, "s", principal=None) is True
+        final = demo.session_store.resolve("s", principal=None)
+        assert final is not None
+        assert 0 not in final.state_data
+        assert final.state_data[1] == "b"
+
+    def test_concurrent_close_wins_over_open_turn(self):
+        demo = self._demo()
+        demo.session_store = self._store()
+        self._seeded(demo, {0: "a"})
+        turn = demo.get_session_state("s", principal=None)
+        closer = demo.get_session_state("s", principal=None)
+        closer.is_closed = True
+        assert demo.save_session_state(closer, "s", principal=None) is True
+        turn.state_data[0] = "b"
+        assert demo.save_session_state(turn, "s", principal=None) is True
+        final = demo.session_store.resolve("s", principal=None)
+        assert final is not None
+        assert final.is_closed is True
+        assert final.state_data[0] == "b"
+
+
 class TestSessionSaveFailure:
     def test_process_api_surfaces_an_exhausted_session_save(self, monkeypatch):
         import asyncio

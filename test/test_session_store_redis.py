@@ -93,6 +93,13 @@ class TestAuthorization:
         b.delete("s1", principal="alice")
         assert b.contains("s1", principal="alice") is False
 
+    def test_second_create_returns_existing_without_takeover(self, two_stores):
+        a, b = two_stores
+        a.create("s1", principal="alice")
+        seen = b.create("s1", principal="bob")
+        assert seen.principal == "alice"
+        assert b.resolve("s1", principal="bob") is None
+
 
 class TestVersionedWrites:
     def test_stale_version_is_rejected(self, two_stores):
@@ -209,6 +216,35 @@ class TestEncryption:
         reader = RedisSessionStore(redis_client, app_id="app-1", encryption_key=wrong)
         with pytest.raises(SessionEnvelopeError):
             reader.resolve("s1", principal=None)
+
+
+class TestUnavailable:
+    """A dead backend surfaces distinctly, never as corrupt data."""
+
+    @staticmethod
+    def _dead_store():
+        redis = pytest.importorskip("redis")
+        from gradio.session_store import (
+            RedisSessionStore,
+            SessionStoreUnavailableError,
+        )
+
+        client = redis.Redis.from_url(
+            "redis://localhost:6399",
+            decode_responses=False,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        return RedisSessionStore(client, app_id="app-1"), SessionStoreUnavailableError
+
+    def test_resolve_create_and_delete_raise_unavailable(self):
+        store, unavailable = self._dead_store()
+        with pytest.raises(unavailable):
+            store.resolve("s1", principal=None)
+        with pytest.raises(unavailable):
+            store.create("s1", principal=None)
+        with pytest.raises(unavailable):
+            store.delete("s1", principal=None)
 
 
 class TestNamespace:

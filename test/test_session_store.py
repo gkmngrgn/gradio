@@ -127,6 +127,13 @@ class TestAuthorization:
         store.delete("s1", principal="alice")
         assert store.contains("s1", principal="alice") is False
 
+    def test_second_create_keeps_first_owner(self):
+        store = _store()
+        store.create("s1", principal="alice")
+        second = store.create("s1", principal="bob")
+        assert second.principal == "alice"
+        assert store.resolve("s1", principal="bob") is None
+
 
 class TestVersionedWrites:
     def test_stale_version_is_rejected(self):
@@ -169,6 +176,17 @@ class TestUrlResolution:
 
         monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "redis://localhost:6379")
         assert isinstance(resolve_session_store(), RedisSessionStore)
+
+    def test_url_client_has_timeouts(self, monkeypatch):
+        pytest.importorskip("redis")
+        from gradio.session_store import RedisSessionStore
+
+        monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "redis://localhost:6379")
+        store = resolve_session_store()
+        assert isinstance(store, RedisSessionStore)
+        kwargs = store._client.connection_pool.connection_kwargs
+        assert kwargs.get("socket_connect_timeout") == 2
+        assert kwargs.get("socket_timeout") == 5
 
     def test_explicit_url_spec_works(self):
         pytest.importorskip("redis")

@@ -69,7 +69,9 @@ class SessionStore(Protocol):
         """Return the session, or ``None`` on a miss. Never creates."""
 
     def create(self, session_hash: str, principal: str | None) -> SessionRecord:
-        """Create a session. Overwrites any existing record for the key."""
+        """Create a session. First writer wins: when the key is taken, the
+        existing record is returned without taking over. Callers must check
+        ``record.principal`` before treating the session as owned."""
 
     def save(
         self,
@@ -141,6 +143,9 @@ class InProcessSessionStore:
         return self._to_record(session_hash, principal)
 
     def create(self, session_hash: str, principal: str | None = None) -> SessionRecord:
+        # First writer wins: never take over another principal's session.
+        if session_hash in self._holder:
+            return self._to_record(session_hash, self._principals.get(session_hash))
         # Use the holder's own creation path so defaults match exactly.
         self._holder[session_hash]
         self._principals[session_hash] = principal
@@ -211,7 +216,7 @@ def resolve_session_store(
     blocks: Blocks | None = None,
     holder: StateHolder | None = None,
     **backend_kwargs: Any,
-) -> InProcessSessionStore:
+) -> SessionStore:
     """Resolve the configured store.
 
     Precedence: an explicit argument, then ``GRADIO_SESSION_STORE_URL``,
@@ -235,7 +240,13 @@ def resolve_session_store(
             import redis  # lazy: the default install never depends on it
 
             backend_kwargs.setdefault(
-                "client", redis.Redis.from_url(name, decode_responses=False)
+                "client",
+                redis.Redis.from_url(
+                    name,
+                    decode_responses=False,
+                    socket_connect_timeout=2,
+                    socket_timeout=5,
+                ),
             )
             name = "redis"
 
@@ -248,7 +259,7 @@ def resolve_session_store(
                 "The Redis session store needs a client. Pass `client=`, a "
                 "`redis://` URL, or set GRADIO_SESSION_STORE_URL."
             )
-        return RedisSessionStore(client, **backend_kwargs)  # type: ignore[return-value]
+        return RedisSessionStore(client, **backend_kwargs)
 
     store_cls = _BUILTIN_STORES.get(name)
     if store_cls is None:
@@ -292,6 +303,21 @@ _TAG_INT_KEY = "intkey"
 class SessionEnvelopeError(Exception):
     """Raised when a session value cannot be encoded, or a stored envelope
     cannot be decoded (unknown schema, wrong key, or corrupt payload)."""
+
+
+class SessionStoreUnavailableError(Exception):
+    """Raised when the backing store cannot be reached (connection loss,
+    timeout, auth). Distinct from ``SessionEnvelopeError`` on purpose: callers
+    must not mistake an outage for corrupt data."""
+
+
+def _redis_unavailable_errors():
+    from redis import exceptions as redis_exceptions
+
+    return (
+        redis_exceptions.ConnectionError,
+        redis_exceptions.TimeoutError,
+    )
 
 
 def _encode_value(value: Any, path: str) -> Any:
@@ -469,10 +495,22 @@ class RedisSessionStore:
         return record.principal == principal
 
     def _read_raw(self, session_hash: str) -> SessionRecord | None:
-        raw = self._client.get(self._key(session_hash))
+        try:
+            raw = self._client.get(self._key(session_hash))
+        except _redis_unavailable_errors() as err:
+            raise SessionStoreUnavailableError(
+                f"Session store is unreachable: {err}"
+            ) from err
         if raw is None:
             return None
-        record, _ = decode_envelope(self._open(raw))
+        try:
+            record, _ = decode_envelope(self._open(raw))
+        except (ValueError, KeyError, TypeError):
+            # Undecodable garbage reads as a miss so one bad key cannot
+            # poison every read. Version and key problems keep raising
+            # SessionEnvelopeError: those are operator-actionable, and the
+            # version-mismatch contract is pinned by test.
+            return None
         return record
 
     def contains(self, session_hash: str, principal: str | None = None) -> bool:
@@ -493,15 +531,27 @@ class RedisSessionStore:
             session_hash=session_hash, principal=principal, version=0
         )
         # SET NX: the first writer wins, so concurrent first requests cannot
-        # each install a different set of defaults.
+        # each install a different set of defaults. A loss that re-reads to
+        # nothing is an expiry race, so retry; a loss that re-reads to a
+        # corrupt record surfaces loudly instead of returning a phantom.
         stored = self._seal(encode_envelope(record))
-        was_set = self._client.set(self._key(session_hash), stored, nx=True)
-        if not was_set:
+        for _ in range(3):
+            try:
+                was_set = self._client.set(self._key(session_hash), stored, nx=True)
+            except _redis_unavailable_errors() as err:
+                raise SessionStoreUnavailableError(
+                    f"Session store is unreachable: {err}"
+                ) from err
+            if was_set:
+                self._touch(session_hash)
+                return record
             existing = self._read_raw(session_hash)
             if existing is not None:
                 return existing
-        self._touch(session_hash)
-        return record
+        raise SessionEnvelopeError(
+            "Session record exists but cannot be read; refusing to return "
+            "a never-persisted record."
+        )
 
     def save(
         self,
@@ -534,14 +584,29 @@ class RedisSessionStore:
             except Exception as err:
                 # A concurrent write raises WatchError: that is a version
                 # conflict, not a serialization failure, so the caller retries.
+                # Codec failures keep their envelope error so the caller can
+                # name the offending state. Anything else (connection loss,
+                # timeout, auth) propagates unwrapped: callers must not
+                # mistake an outage for corrupt data.
                 if type(err).__name__ == "WatchError":
                     return False
-                raise SessionEnvelopeError(f"Failed to save session: {err}") from err
+                if isinstance(
+                    err, (SessionEnvelopeError, ValueError, KeyError, TypeError)
+                ):
+                    raise SessionEnvelopeError(
+                        f"Failed to save session: {err}"
+                    ) from err
+                raise
 
     def delete(self, session_hash: str, principal: str | None = None) -> None:
         if not self._owns(session_hash, principal):
             return
-        self._client.delete(self._key(session_hash))
+        try:
+            self._client.delete(self._key(session_hash))
+        except _redis_unavailable_errors() as err:
+            raise SessionStoreUnavailableError(
+                f"Session store is unreachable: {err}"
+            ) from err
 
     def delete_all_expired_state(self) -> None:
         # Expiry is Redis's own TTL; nothing to sweep here.
@@ -549,10 +614,20 @@ class RedisSessionStore:
 
     def _touch(self, session_hash: str) -> None:
         if self.ttl_seconds:
-            self._client.expire(self._key(session_hash), self.ttl_seconds)
+            try:
+                self._client.expire(self._key(session_hash), self.ttl_seconds)
+            except _redis_unavailable_errors() as err:
+                raise SessionStoreUnavailableError(
+                    f"Session store is unreachable: {err}"
+                ) from err
 
     def __len__(self) -> int:
-        return sum(1 for _ in self._client.scan_iter(match=self._match_pattern()))
+        try:
+            return sum(1 for _ in self._client.scan_iter(match=self._match_pattern()))
+        except _redis_unavailable_errors() as err:
+            raise SessionStoreUnavailableError(
+                f"Session store is unreachable: {err}"
+            ) from err
 
     def _match_pattern(self) -> str | bytes:
         pattern = f"{self.prefix}:{self.app_id}:{self.tenant}:*"

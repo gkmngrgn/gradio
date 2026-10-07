@@ -2874,6 +2874,15 @@ Received inputs:
         state._session_snapshot = dict(record.state_data)  # type: ignore[attr-defined]
         return state
 
+    @staticmethod
+    def _values_equal(first: Any, second: Any) -> bool:
+        if first is second:
+            return True
+        try:
+            return bool(first == second)
+        except Exception:
+            return False
+
     def save_session_state(
         self,
         state: SessionState,
@@ -2896,22 +2905,31 @@ Received inputs:
             record = SessionRecord(session_hash=session_hash, principal=principal)
 
         # The keys this turn changed relative to what it loaded, used to merge
-        # onto a newer version if another turn wrote first.
+        # onto a newer version if another turn wrote first. Values compare by
+        # guarded equality: array-likes raise on truth-testing, and those
+        # count as changed rather than crashing the save.
         snapshot = getattr(state, "_session_snapshot", None)
         current = dict(state.state_data)
         changed = (
             current
             if snapshot is None
-            else {k: v for k, v in current.items() if snapshot.get(k) != v}
+            else {
+                k: v
+                for k, v in current.items()
+                if not self._values_equal(snapshot.get(k), v)
+            }
         )
         deleted = set(snapshot or {}) - set(current)
 
         expected = record.version
+        closed = state.is_closed
         for _ in range(8):
             record.session_hash = session_hash
             record.principal = principal
             record.state_data = dict(state.state_data)
-            record.is_closed = state.is_closed
+            # A concurrent close wins over this turn's open state: once True,
+            # closed sticks for the rest of the retry loop.
+            record.is_closed = closed
             try:
                 saved = store.save(
                     record, expected_version=expected, principal=principal
@@ -2933,6 +2951,7 @@ Received inputs:
             for key in deleted:
                 merged.pop(key, None)
             state.state_data = merged
+            closed = closed or latest.is_closed
             record = latest
             expected = latest.version
         return False
