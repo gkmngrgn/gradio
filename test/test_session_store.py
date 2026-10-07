@@ -188,6 +188,29 @@ class TestUrlResolution:
         assert kwargs.get("socket_connect_timeout") == 2
         assert kwargs.get("socket_timeout") == 5
 
+    def test_redis_options_come_from_env(self, monkeypatch):
+        pytest.importorskip("redis")
+        from gradio.session_store import RedisSessionStore
+
+        monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "redis://localhost:6379")
+        monkeypatch.setenv("GRADIO_REDIS_SOCKET_TIMEOUT", "30")
+        monkeypatch.setenv("GRADIO_REDIS_RETRY_ON_TIMEOUT", "true")
+        monkeypatch.setenv("GRADIO_REDIS_MAX_CONNECTIONS", "50")
+        store = resolve_session_store()
+        assert isinstance(store, RedisSessionStore)
+        kwargs = store._client.connection_pool.connection_kwargs
+        assert kwargs.get("socket_timeout") == 30
+        assert kwargs.get("retry_on_timeout") is True
+        assert store._client.connection_pool.max_connections == 50
+
+    def test_bad_redis_option_fails_fast(self, monkeypatch):
+        pytest.importorskip("redis")
+
+        monkeypatch.setenv("GRADIO_SESSION_STORE_URL", "redis://localhost:6379")
+        monkeypatch.setenv("GRADIO_REDIS_SOCKET_TIMEOUT", "soon")
+        with pytest.raises(ValueError, match="GRADIO_REDIS_SOCKET_TIMEOUT"):
+            resolve_session_store()
+
     def test_explicit_url_spec_works(self):
         pytest.importorskip("redis")
         from gradio.session_store import RedisSessionStore

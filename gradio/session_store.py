@@ -35,6 +35,57 @@ if TYPE_CHECKING:
 
 SESSION_STORE_URL_ENV_VAR = "GRADIO_SESSION_STORE_URL"
 
+# Operator-tunable Redis client options, all optional and Helm-friendly.
+# Each names the redis-py keyword it feeds; values are coerced and a bad
+# value fails fast at startup rather than silently misconfiguring.
+_REDIS_ENV_OPTIONS: dict[str, Any] = {
+    "GRADIO_REDIS_SOCKET_CONNECT_TIMEOUT": float,
+    "GRADIO_REDIS_SOCKET_TIMEOUT": float,
+    "GRADIO_REDIS_SOCKET_KEEPALIVE": None,  # bool-like, see _to_bool
+    "GRADIO_REDIS_RETRY_ON_TIMEOUT": None,  # bool-like, see _to_bool
+    "GRADIO_REDIS_HEALTH_CHECK_INTERVAL": float,
+    "GRADIO_REDIS_MAX_CONNECTIONS": int,
+}
+_REDIS_ENV_TO_KWARG = {
+    "GRADIO_REDIS_SOCKET_CONNECT_TIMEOUT": "socket_connect_timeout",
+    "GRADIO_REDIS_SOCKET_TIMEOUT": "socket_timeout",
+    "GRADIO_REDIS_SOCKET_KEEPALIVE": "socket_keepalive",
+    "GRADIO_REDIS_RETRY_ON_TIMEOUT": "retry_on_timeout",
+    "GRADIO_REDIS_HEALTH_CHECK_INTERVAL": "health_check_interval",
+    "GRADIO_REDIS_MAX_CONNECTIONS": "max_connections",
+}
+
+
+def _to_bool(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _redis_client_kwargs() -> dict[str, Any]:
+    """Collect redis-py client options from the environment.
+
+    Sane timeout defaults apply when unset; every other option is passed
+    only when its variable is set. An unparseable value raises immediately
+    so a misconfigured deploy fails at startup, not at 3am.
+    """
+    kwargs: dict[str, Any] = {
+        "socket_connect_timeout": 2,
+        "socket_timeout": 5,
+    }
+    for env_var, coerce in _REDIS_ENV_OPTIONS.items():
+        raw = os.getenv(env_var)
+        if raw is None or raw.strip() == "":
+            continue
+        convert = _to_bool if coerce is None else coerce
+        try:
+            parsed = convert(raw)
+        except ValueError as err:
+            raise ValueError(
+                f"{env_var}={raw!r} is not a valid "
+                f"{'boolean' if coerce is None else coerce.__name__}."
+            ) from err
+        kwargs[_REDIS_ENV_TO_KWARG[env_var]] = parsed
+    return kwargs
+
 
 @dataclass
 class SessionRecord:
@@ -242,10 +293,7 @@ def resolve_session_store(
             backend_kwargs.setdefault(
                 "client",
                 redis.Redis.from_url(
-                    name,
-                    decode_responses=False,
-                    socket_connect_timeout=2,
-                    socket_timeout=5,
+                    name, decode_responses=False, **_redis_client_kwargs()
                 ),
             )
             name = "redis"
