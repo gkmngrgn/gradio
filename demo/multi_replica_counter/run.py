@@ -12,9 +12,13 @@ consistent across replicas with no affinity.
 import gradio as gr
 
 
-def turn(counter):
+def turn(counter, request: gr.Request):
     counter = (counter or 0) + 1
-    return counter, f"count={counter}"
+    return counter, f"count={counter} session={request.session_hash}"
+
+
+def show(request: gr.Request):
+    return 0, f"session={request.session_hash} (fresh page load)"
 
 
 with gr.Blocks() as demo:
@@ -23,6 +27,7 @@ with gr.Blocks() as demo:
     out = gr.Textbox(label="last turn")
     btn = gr.Button("turn")
     btn.click(turn, state, [state, out], api_name="turn")
+    demo.load(show, None, [state, out])
 
 if __name__ == "__main__":
     demo.launch()
