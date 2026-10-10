@@ -3785,3 +3785,163 @@ def test_a_failed_flush_still_ends_the_runs_other_streams(monkeypatch):
         assert "direct" not in demo.pending_diff_streams
     finally:
         demo.close()
+
+
+class TestRequestScopedSessionResolution:
+    """U3: every session read/write routes through the configured store.
+
+    A second store instance over the same backend stands in for a second
+    replica: the store differs while the app config is shared.
+    """
+
+    @staticmethod
+    def _demo():
+        with gr.Blocks() as demo:
+            state = gr.State(0)
+            out = gr.Number()
+            gr.Button().click(lambda s: (s + 1, s + 1), [state], [out, state])
+        return demo, state
+
+    @staticmethod
+    def _store(client, app_id="app-1"):
+        from gradio.session_store import RedisSessionStore
+
+        return RedisSessionStore(client, app_id=app_id)
+
+    @staticmethod
+    def _client():
+        import fakeredis
+
+        return fakeredis.FakeRedis(decode_responses=False)
+
+    def test_session_resolves_on_a_second_store_instance(self):
+        client = self._client()
+        demo, state = self._demo()
+        demo.session_store = self._store(client)
+
+        record = demo.get_session_state("h")
+        assert record is not None
+        record.state_data[state._id] = 7
+        assert demo.save_session_state(record, "h") is True
+
+        demo.session_store = self._store(client)
+        seen = demo.get_session_state("h")
+        assert seen is not None
+        assert seen.state_data[state._id] == 7
+
+    def test_new_session_is_created_once(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+
+        assert demo.get_session_state("h") is not None
+        assert demo.get_session_state("h") is not None
+        assert len(demo.session_store) == 1
+
+    def test_process_api_without_state_resolves_through_the_store(self):
+        client = self._client()
+        demo, state = self._demo()
+        demo.session_store = self._store(client)
+
+        record = demo.session_store.create("h", principal=None)
+        record.state_data[state._id] = 41
+        demo.session_store.save(record, record.version)
+
+        output = asyncio.run(demo.process_api(0, [None], state=None, session_hash="h"))
+        assert output["data"][0] == 42
+        stored = demo.session_store.resolve("h", principal=None)
+        assert stored is not None
+        assert stored.state_data[state._id] == 42
+
+    def test_concurrent_turns_do_not_lose_an_update(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+
+        record = demo.session_store.create("h", principal=None)
+        record.state_data = {0: "a", 1: "b"}
+        demo.session_store.save(record, record.version)
+
+        turn_one = demo.get_session_state("h")
+        turn_two = demo.get_session_state("h")
+        assert turn_one is not None and turn_two is not None
+        turn_one.state_data[0] = "a2"
+        turn_two.state_data[1] = "b2"
+
+        assert demo.save_session_state(turn_one, "h") is True
+        assert demo.save_session_state(turn_two, "h") is True
+        final = demo.session_store.resolve("h", principal=None)
+        assert final is not None
+        assert final.state_data == {0: "a2", 1: "b2"}
+
+    def test_another_principals_session_is_refused(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+        demo.session_store.create("h", principal="alice")
+
+        assert demo.get_session_state("h", "bob", create=True) is None
+        assert demo.get_session_state("h", "bob", create=False) is None
+        assert demo.get_session_state("h", "alice") is not None
+
+    def test_get_fn_falls_back_to_app_fns_for_foreign_hash(self):
+        from gradio.data_classes import PredictBody
+        from gradio.route_utils import get_fn
+
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+        demo.session_store.create("h", principal="alice")
+
+        body = PredictBody(session_hash="h", data=[], fn_index=0)
+        assert (
+            get_fn(blocks=demo, api_name=None, body=body, principal="bob")
+            is demo.fns[0]
+        )
+
+    def test_restore_session_state_refuses_foreign_principal(self):
+        import asyncio
+
+        from gradio import route_utils, routes
+        from gradio.data_classes import PredictBodyInternal
+
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+        demo.session_store.create("h", principal="alice")
+        app = routes.App.create_app(demo)
+
+        body = PredictBodyInternal(session_hash="h", data=[])
+        with pytest.raises(ValueError, match="another principal"):
+            asyncio.run(
+                route_utils.restore_session_state(app=app, body=body, principal="bob")
+            )
+
+    def test_session_close_persists_for_the_external_path(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+
+        state = demo.get_session_state("h")
+        assert state is not None
+        state.is_closed = True
+        assert demo.save_session_state(state, "h") is True
+
+        demo.session_store = self._store(client)
+        reopened = demo.get_session_state("h", create=False)
+        assert reopened is not None
+        assert reopened.is_closed is True
+
+    def test_default_path_stays_in_process(self):
+        from gradio.state_holder import StateHolder
+
+        demo, _ = self._demo()
+        holder = StateHolder()
+        holder.set_blocks(demo)
+
+        assert demo.session_store is None
+        first = demo.get_session_state("h")
+        assert first is demo.state_holder["h"]
+        first.state_data[0] = "kept"
+        assert demo.get_session_state("h").state_data[0] == "kept"
+        assert demo.save_session_state(first, "h") is True

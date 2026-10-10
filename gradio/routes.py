@@ -853,12 +853,12 @@ class App(FastAPI):
                 )
 
         @app.get("/gradio_api/deep_link", dependencies=[Depends(login_check)])
-        def deep_link(session_hash: str):
-            if session_hash in app.state_holder:
-                components = [
-                    utils.safe_deepcopy(c)
-                    for c in app.state_holder[session_hash].components
-                ]
+        def deep_link(session_hash: str, username: str = Depends(get_current_user)):
+            state = app.get_blocks().get_session_state(
+                session_hash, username, create=False
+            )
+            if state is not None:
+                components = [utils.safe_deepcopy(c) for c in state.components]
                 components_json = orjson.dumps(
                     components,
                     option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_PASSTHROUGH_DATETIME,
@@ -1519,8 +1519,15 @@ class App(FastAPI):
                                 root_path=root_path,
                             )
                         # This will mark the state to be deleted in an hour
-                        if session_hash in app.state_holder.session_data:
-                            app.state_holder.session_data[session_hash].is_closed = True
+                        blocks = app.get_blocks()
+                        closed_state = blocks.get_session_state(
+                            session_hash, username, create=False
+                        )
+                        if closed_state is not None:
+                            closed_state.is_closed = True
+                            blocks.save_session_state(
+                                closed_state, session_hash, username
+                            )
                         caching.clear_session_caches(session_hash)
                         # Streams only; diff state is dropped by the queue when
                         # the run ends
@@ -1563,7 +1570,10 @@ class App(FastAPI):
             # a direct call names no job and nothing would continue the run.
             body.event_id = None
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=body,
+                principal=username,
             )
 
             if not app.get_blocks().api_open and fn.queue:
@@ -1647,7 +1657,10 @@ class App(FastAPI):
             )
             full_body = PredictBody(**simple_body.model_dump(), simple_format=True)  # type: ignore
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=full_body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=full_body,
+                principal=username,
             )
             prepare_simple_api_data(full_body, fn)
             full_body.fn_index = fn._id
@@ -1663,7 +1676,10 @@ class App(FastAPI):
         ):
             full_body = PredictBody(**body.model_dump(), simple_format=True)  # type: ignore
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=full_body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=full_body,
+                principal=username,
             )
             prepare_simple_api_data(full_body, fn)
             full_body.fn_index = fn._id
@@ -1983,9 +1999,16 @@ class App(FastAPI):
         )
         async def component_server(
             request: fastapi.Request,
+            username: str = Depends(get_current_user),
         ):
             body = await get_item_or_file(request)
-            state = app.state_holder[body.session_hash]
+            blocks = app.get_blocks()
+            state = blocks.get_session_state(body.session_hash, username, create=True)
+            if state is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Session not found.",
+                )
             component_id = body.component_id
             block: Block
             if component_id in state:
