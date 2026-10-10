@@ -16,6 +16,7 @@ import secrets
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import unicodedata
 import uuid
@@ -280,10 +281,20 @@ class FnIndexInferError(Exception):
     pass
 
 
-def get_fn(blocks: Blocks, api_name: str | None, body: PredictBody) -> BlockFunction:
+def get_fn(
+    blocks: Blocks,
+    api_name: str | None,
+    body: PredictBody,
+    principal: str | None = None,
+) -> BlockFunction:
     if body.session_hash:
-        session_state = blocks.state_holder[body.session_hash]
-        fns = session_state.blocks_config.fns
+        # On the in-process path this auto-creates like the holder always did;
+        # with an external store a miss (or another principal's hash) stays a
+        # miss and falls back to the app's own fn table rather than minting.
+        session_state = blocks.get_session_state(
+            body.session_hash, principal, create=blocks.session_store is None
+        )
+        fns = session_state.blocks_config.fns if session_state else blocks.fns
     else:
         fns = blocks.fns
 
@@ -332,11 +343,23 @@ def compile_gr_request(
     return gr_request
 
 
-def restore_session_state(app: App, body: PredictBodyInternal):
+def restore_session_state(
+    app: App, body: PredictBodyInternal, principal: str | None = None
+):
     event_id = body.event_id
     session_hash = getattr(body, "session_hash", None)
     if session_hash is not None:
-        session_state = app.state_holder[session_hash]
+        blocks = app.get_blocks()
+        if blocks.session_store is not None:
+            session_state = blocks.get_session_state(
+                session_hash, principal, create=True
+            )
+            if session_state is None:
+                raise ValueError(
+                    "Session not found, or it belongs to another principal."
+                )
+        else:
+            session_state = app.state_holder[session_hash]
         # The should_reset set keeps track of the fn_indices
         # that have been cancelled. When a job is cancelled,
         # the /reset route will mark the jobs as having been reset.
@@ -350,10 +373,26 @@ def restore_session_state(app: App, body: PredictBodyInternal):
         else:
             iterator = app.iterators.get(event_id)
     else:
+        # No session identity: a transient state, never persisted behind the store.
         session_state = SessionState(app.get_blocks())
         iterator = None
 
     return session_state, iterator
+
+
+def principal_from_request(
+    request: Union[Request, list[Request], None],
+) -> str | None:
+    """The authenticated username carried on a request, if any.
+
+    When ``auth=`` is set the principal is the username; otherwise it is
+    ``None`` and the client session identity is the only owner. A call site that
+    cannot name a principal passes ``None`` explicitly rather than resolving by
+    hash alone.
+    """
+    if isinstance(request, list):
+        request = request[0] if request else None
+    return getattr(request, "username", None)
 
 
 def prepare_event_data(
@@ -394,7 +433,10 @@ async def call_process_api(
     fn: BlockFunction,
     root_path: str,
 ):
-    session_state, iterator = restore_session_state(app=app, body=body)
+    principal = principal_from_request(gr_request)
+    session_state, iterator = restore_session_state(
+        app=app, body=body, principal=principal
+    )
 
     event_data = prepare_event_data(session_state.blocks_config, body)
     event_id = body.event_id
@@ -447,6 +489,16 @@ async def call_process_api(
     if batch_in_single_out:
         output["data"] = output["data"][0]
 
+    # Generated file outputs are cached locally by component postprocessing.
+    # Commit them to the shared store before returning their URLs to the client.
+    if output.get("data") is not None and app.get_blocks().file_store is not None:
+        store_generated_files(
+            app.get_blocks(),
+            output["data"],
+            session_hash,
+            principal,
+        )
+
     _record_run_history(
         app,
         fn=fn,
@@ -457,6 +509,32 @@ async def call_process_api(
         is_final=not output.get("is_generating"),
     )
     return output
+
+
+def store_generated_files(
+    blocks: Blocks,
+    data: Any,
+    session_hash: str | None,
+    principal: str | None,
+) -> None:
+    """Commit generated file outputs to shared storage before returning them."""
+    store = blocks.file_store
+    if store is None or session_hash is None:
+        return
+
+    def store_file(file_data: dict[str, Any]) -> dict[str, Any]:
+        path = file_data.get("path")
+        if not path:
+            return file_data
+        absolute = utils.abspath(path)
+        if not utils.is_in_or_equal(absolute, blocks.GRADIO_CACHE):
+            return file_data
+        key = upload_store_key(str(absolute), blocks.GRADIO_CACHE)
+        if store.resolve(key, principal) is None:
+            store.put(str(absolute), key, owner=principal, session_hash=session_hash)
+        return file_data
+
+    client_utils.traverse(data, store_file, client_utils.is_file_obj_with_meta)
 
 
 def _record_run_history(
@@ -1146,8 +1224,39 @@ async def _lifespan_handler(
 async def _delete_state(app: App):
     """Delete all expired state every second."""
     while True:
-        app.state_holder.delete_all_expired_state()
+        blocks = app.get_blocks()
+        if blocks.session_store is not None:
+            # The external store owns its lifecycle: sweep closed sessions past
+            # retention, then collect files orphaned by them.
+            removed = blocks.sweep_sessions()
+            if removed:
+                _collect_orphaned_files(blocks)
+        else:
+            blocks.state_holder.delete_all_expired_state()
         await asyncio.sleep(1)
+
+
+# A file whose session is absent is only collected after this grace window, so
+# an upload committed before its session record exists is not deleted at once.
+FILE_GC_GRACE_SECONDS = 3600.0
+
+
+def _collect_orphaned_files(
+    blocks: Blocks, grace_seconds: float = FILE_GC_GRACE_SECONDS
+) -> None:
+    """Delete stored files whose owning session is gone past a grace window."""
+    store = blocks.file_store
+    session_store = blocks.session_store
+    if store is None or session_store is None:
+        return
+    now = time.time()
+    for record in store.list_records():
+        if record.session_hash is None:
+            continue
+        if now - record.committed_at < grace_seconds:
+            continue
+        if session_store.resolve(record.session_hash, record.owner) is None:
+            store.delete(record.key)
 
 
 @asynccontextmanager
@@ -1506,6 +1615,15 @@ def file_fetch(
     if not allowed:
         raise HTTPException(403, f"File not allowed: {path_or_url}.")
 
+    return serve_path(abs_path, request, reason)
+
+
+def serve_path(abs_path, request, reason):
+    """Serve a validated local path, with range support and safe MIME typing.
+
+    Shared by the local path and by a file an external store has already
+    ownership-checked and materialized.
+    """
     mime_type, _ = mimetypes.guess_type(abs_path)
     if mime_type in XSS_SAFE_MIMETYPES or reason == "allowed":
         media_type = mime_type or "application/octet-stream"
@@ -1540,6 +1658,11 @@ def file_fetch(
         media_type=media_type,
         filename=abs_path.name,
     )
+
+
+def upload_store_key(path_or_url: str, upload_dir: str) -> str:
+    """The store key for a file: its path relative to the upload directory."""
+    return os.path.relpath(utils.abspath(path_or_url), utils.abspath(upload_dir))
 
 
 async def upload_fn(

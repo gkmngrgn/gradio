@@ -4,9 +4,11 @@ module use the Optional/Union notation so that they work correctly with pydantic
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import dataclasses
 import hashlib
+import hmac
 import inspect
 import io
 import json
@@ -305,6 +307,76 @@ _proxy_transport = httpx2.AsyncHTTPTransport(
 
 file_upload_statuses = FileUploadProgress()
 
+AUTH_SECRET_ENV_VAR = "GRADIO_AUTH_SECRET"
+AUTH_TOKEN_TTL_ENV_VAR = "GRADIO_AUTH_TOKEN_TTL"
+
+
+class SignedTokenAuth:
+    """HMAC-signed, expiring auth tokens that verify without process state.
+
+    The default Gradio auth keeps a token in the process-local ``app.tokens``
+    dict, so a login on one replica is unknown to another. With an
+    operator-supplied secret, a token carries its user and expiry and any replica
+    validates it, removing the need for session affinity.
+
+    Revocations are a set-like shared by the replicas (a plain ``set`` for one
+    process; a Redis-backed set in a real deployment). A revoked or expired token
+    verifies to ``None``. Only the presented token is revoked, so a full
+    ``all_session`` logout is bounded by the token TTL.
+    """
+
+    def __init__(self, secret: str | bytes, ttl: int = 3600, revocations=None):
+        if not secret:
+            raise ValueError("a signing secret is required")
+        self._key = secret.encode() if isinstance(secret, str) else secret
+        self.ttl = int(ttl)
+        # ponytail: entries expire with their token's TTL, so the set is bounded
+        # by `ttl`; move to a TTL-indexed store if that stops holding.
+        self.revocations = revocations if revocations is not None else set()
+
+    @staticmethod
+    def _b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    @staticmethod
+    def _unb64(text: str) -> bytes:
+        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+    def _sign(self, raw: bytes) -> bytes:
+        return hmac.new(self._key, raw, hashlib.sha256).digest()
+
+    def mint(self, username: str) -> str:
+        payload = {
+            "u": username,
+            "e": int(time.time()) + self.ttl,
+            "j": secrets.token_urlsafe(8),
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return f"{self._b64(raw)}.{self._b64(self._sign(raw))}"
+
+    def verify(self, token: str | None) -> str | None:
+        if not token or token in self.revocations:
+            return None
+        try:
+            raw_b64, sig_b64 = token.split(".", 1)
+            raw = self._unb64(raw_b64)
+            signature = self._unb64(sig_b64)
+        except (ValueError, TypeError):
+            return None
+        if not hmac.compare_digest(signature, self._sign(raw)):
+            return None
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        if int(payload.get("e", 0)) < time.time():
+            return None
+        return payload.get("u")
+
+    def revoke(self, token: str | None) -> None:
+        if token:
+            self.revocations.add(token)
+
 
 class App(FastAPI):
     """
@@ -320,6 +392,7 @@ class App(FastAPI):
         **kwargs,
     ):
         self.tokens = {}
+        self.signed_auth: SignedTokenAuth | None = None
         self.auth = None
         self.analytics_key = secrets.token_urlsafe(16)
         self.monitoring_enabled = False
@@ -366,6 +439,35 @@ class App(FastAPI):
         self.cwd = os.getcwd()
         self.favicon_path = blocks.favicon_path
         self.tokens = {}
+        # Signed tokens are opt-in and are tied to multi-replica mode: a login
+        # on one replica is recognized on another through them. An explicit
+        # `auth_secret` attribute, or the multi-replica preset, activates them.
+        # A bare GRADIO_AUTH_SECRET env var on an otherwise single-process app
+        # would silently change /user and /logout semantics, so it is ignored
+        # with a warning unless an external store is configured.
+        explicit_secret = getattr(blocks, "auth_secret", None)
+        env_secret = os.getenv(AUTH_SECRET_ENV_VAR)
+        multi_replica = blocks.session_store is not None
+        secret = explicit_secret or (env_secret if multi_replica else None)
+        if env_secret and not multi_replica and not explicit_secret:
+            warnings.warn(
+                f"{AUTH_SECRET_ENV_VAR} is set but multi-replica mode is not "
+                f"configured; ignoring it so single-process auth behavior (and "
+                f"/logout) is unchanged. Set `auth_secret` to opt in explicitly.",
+                stacklevel=2,
+            )
+        self.signed_auth = None
+        if secret:
+            ttl = (
+                getattr(blocks, "auth_token_ttl", None)
+                or os.getenv(AUTH_TOKEN_TTL_ENV_VAR)
+                or 3600
+            )
+            self.signed_auth = SignedTokenAuth(
+                secret,
+                ttl=int(ttl),
+                revocations=getattr(blocks, "auth_token_revocations", None),
+            )
         self.root_path = blocks.root_path or (
             "" if blocks.custom_mount_path is not None else self.root_path
         )
@@ -504,9 +606,14 @@ class App(FastAPI):
                 if inspect.isawaitable(user):
                     user = await user
                 return user
-            token = request.cookies.get(
-                f"access-token-{app.cookie_id}"
-            ) or request.cookies.get(f"access-token-unsecure-{app.cookie_id}")
+            secure = request.cookies.get(f"access-token-{app.cookie_id}")
+            if app.signed_auth is not None:
+                # Only the secure cookie authenticates; the unsecure cookie is
+                # lower trust and must not bypass the shared signed check.
+                return app.signed_auth.verify(secure)
+            token = secure or request.cookies.get(
+                f"access-token-unsecure-{app.cookie_id}"
+            )
             return app.tokens.get(token)
 
         @router.get("/login_check")
@@ -526,7 +633,12 @@ class App(FastAPI):
         @router.get("/token/")
         def get_token(request: fastapi.Request) -> dict:
             token = request.cookies.get(f"access-token-{app.cookie_id}")
-            return {"token": token, "user": app.tokens.get(token)}
+            user = (
+                app.signed_auth.verify(token)
+                if app.signed_auth is not None
+                else app.tokens.get(token)
+            )
+            return {"token": token, "user": user}
 
         @router.get("/app_id")
         @router.get("/app_id/")
@@ -591,8 +703,11 @@ class App(FastAPI):
                     else app.auth(username, password)
                 )
             ):  # type: ignore
-                token = secrets.token_urlsafe(16)
-                app.tokens[token] = username
+                if app.signed_auth is not None:
+                    token = app.signed_auth.mint(username)
+                else:
+                    token = secrets.token_urlsafe(16)
+                    app.tokens[token] = username
                 response = JSONResponse(content={"success": True})
                 response.set_cookie(
                     key=f"access-token-{app.cookie_id}",
@@ -637,7 +752,13 @@ class App(FastAPI):
                 response.delete_cookie(
                     key=f"access-token-unsecure-{app.cookie_id}", path="/"
                 )
-                if all_session:
+                if app.signed_auth is not None:
+                    # Statelessly we can revoke only the presented token; a full
+                    # all-session logout is bounded by the token TTL.
+                    app.signed_auth.revoke(
+                        request.cookies.get(f"access-token-{app.cookie_id}")
+                    )
+                elif all_session:
                     # Delete the tokens of all sessions associated with the current user.
                     for token in list(app.tokens.keys()):
                         if app.tokens[token] == user:
@@ -927,12 +1048,12 @@ class App(FastAPI):
                 )
 
         @app.get("/gradio_api/deep_link", dependencies=[Depends(login_check)])
-        def deep_link(session_hash: str):
-            if session_hash in app.state_holder:
-                components = [
-                    utils.safe_deepcopy(c)
-                    for c in app.state_holder[session_hash].components
-                ]
+        def deep_link(session_hash: str, username: str = Depends(get_current_user)):
+            state = app.get_blocks().get_session_state(
+                session_hash, username, create=False
+            )
+            if state is not None:
+                components = [utils.safe_deepcopy(c) for c in state.components]
                 components_json = orjson.dumps(
                     components,
                     option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_PASSTHROUGH_DATETIME,
@@ -1402,10 +1523,28 @@ class App(FastAPI):
 
         @router.head("/file={path_or_url:path}", dependencies=[Depends(login_check)])
         @router.get("/file={path_or_url:path}", dependencies=[Depends(login_check)])
-        async def file(path_or_url: str, request: fastapi.Request):
+        async def file(
+            path_or_url: str,
+            request: fastapi.Request,
+            username: str = Depends(get_current_user),
+        ):
             if client_utils.is_http_url_like(path_or_url):
                 return await secure_url_stream_response(path_or_url, request)
             blocks = app.get_blocks()
+            # Only files under the upload directory are store-owned; anything
+            # else (allowed_paths, static files) keeps the local path below.
+            if blocks.file_store is not None and utils.is_in_or_equal(
+                utils.abspath(path_or_url), utils.abspath(app.uploaded_file_dir)
+            ):
+                key = route_utils.upload_store_key(path_or_url, app.uploaded_file_dir)
+                local = blocks.fetch_file(key, username)
+                if local is not None:
+                    return route_utils.serve_path(local, request, "created")
+                # No store record: a generated output file (only /upload commits)
+                # or a file this principal does not own. Serve it from the local
+                # path when it exists here, so outputs remain reachable on the
+                # producing replica; otherwise fall through to the guarded local
+                # fetch, which returns 403 for a path outside allowed roots.
             return file_fetch(path_or_url, request, blocks, app.uploaded_file_dir)
 
         @router.post("/stream/{event_id}")
@@ -1593,8 +1732,15 @@ class App(FastAPI):
                                 root_path=root_path,
                             )
                         # This will mark the state to be deleted in an hour
-                        if session_hash in app.state_holder.session_data:
-                            app.state_holder.session_data[session_hash].is_closed = True
+                        blocks = app.get_blocks()
+                        closed_state = blocks.get_session_state(
+                            session_hash, username, create=False
+                        )
+                        if closed_state is not None:
+                            closed_state.is_closed = True
+                            blocks.save_session_state(
+                                closed_state, session_hash, username
+                            )
                         caching.clear_session_caches(session_hash)
                         # Streams only; diff state is dropped by the queue when
                         # the run ends
@@ -1637,7 +1783,10 @@ class App(FastAPI):
             # a direct call names no job and nothing would continue the run.
             body.event_id = None
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=body,
+                principal=username,
             )
 
             if not app.get_blocks().api_open and fn.queue:
@@ -1721,7 +1870,10 @@ class App(FastAPI):
             )
             full_body = PredictBody(**simple_body.model_dump(), simple_format=True)  # type: ignore
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=full_body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=full_body,
+                principal=username,
             )
             prepare_simple_api_data(full_body, fn)
             full_body.fn_index = fn._id
@@ -1737,7 +1889,10 @@ class App(FastAPI):
         ):
             full_body = PredictBody(**body.model_dump(), simple_format=True)  # type: ignore
             fn = route_utils.get_fn(
-                blocks=app.get_blocks(), api_name=api_name, body=full_body
+                blocks=app.get_blocks(),
+                api_name=api_name,
+                body=full_body,
+                principal=username,
             )
             prepare_simple_api_data(full_body, fn)
             full_body.fn_index = fn._id
@@ -2090,9 +2245,16 @@ class App(FastAPI):
         )
         async def component_server(
             request: fastapi.Request,
+            username: str = Depends(get_current_user),
         ):
             body = await get_item_or_file(request)
-            state = app.state_holder[body.session_hash]
+            blocks = app.get_blocks()
+            state = blocks.get_session_state(body.session_hash, username, create=True)
+            if state is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Session not found.",
+                )
             component_id = body.component_id
             block: Block
             if component_id in state:
@@ -2200,6 +2362,7 @@ class App(FastAPI):
             request: fastapi.Request,
             bg_tasks: BackgroundTasks,
             upload_id: str | None = None,
+            username: str = Depends(get_current_user),
         ):
             start = None
             if PROFILING_ENABLED:
@@ -2218,6 +2381,18 @@ class App(FastAPI):
             except MultiPartException as exc:
                 code = 413 if "maximum allowed size" in exc.message else 400
                 return PlainTextResponse(exc.message, status_code=code)
+
+            # Commit bytes and ownership before acknowledging the upload (R5),
+            # so a file is never servable before it is attributable.
+            if blocks.file_store is not None:
+                session_hash = request.headers.get("session_hash")
+                for dest in output_files:
+                    blocks.store_upload(
+                        dest,
+                        route_utils.upload_store_key(dest, app.uploaded_file_dir),
+                        owner=username,
+                        session_hash=session_hash,
+                    )
 
             if files_to_copy:
                 bg_tasks.add_task(

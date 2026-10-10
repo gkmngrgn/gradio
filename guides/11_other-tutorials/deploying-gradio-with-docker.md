@@ -73,9 +73,47 @@ When running Gradio applications in Docker, there are a few important things to 
 
 In the Docker environment, setting `GRADIO_SERVER_NAME="0.0.0.0"` as an environment variable (or directly in your Gradio app's `launch()` function) is crucial for allowing connections from outside the container. And the `EXPOSE 7860` directive in the Dockerfile tells Docker to expose Gradio's default port on the container to enable external access to the Gradio app. 
 
-#### Enable Stickiness for Multiple Replicas
+#### Running Multiple Replicas
 
-When deploying Gradio apps with multiple replicas, such as on AWS ECS, it's important to enable stickiness with `sessionAffinity: ClientIP`. This ensures that all requests from the same user are routed to the same instance. This is important because Gradio's communication protocol requires multiple separate connections from the frontend to the backend in order for events to be processed correctly. (If you use Terraform, you'll want to add a [stickiness block](https://registry.terraform.io/providers/hashicorp/aws/3.14.1/docs/resources/lb_target_group#stickiness) into your target group definition.)
+A Gradio app keeps a session's state, files, `auth=`, and `@gr.render` state in one process. With multiple replicas behind a load balancer that has no session affinity, a request can reach a replica that never saw the session, which produces a `session_not_found` error or silently empty state. There are two ways to run multiple replicas:
+
+1. **Enable session affinity (default mode).** Turn on stickiness with `sessionAffinity: ClientIP` so all requests from the same user reach the same instance. This is required because Gradio's communication protocol needs multiple connections from the frontend to reach the same backend for an event to be processed correctly. (If you use Terraform, add a [stickiness block](https://registry.terraform.io/providers/hashicorp/aws/3.14.1/docs/resources/lb_target_group#stickiness) to your target group definition.) Affinity still fails when an autoscaler removes the instance holding a session.
+
+2. **Enable multi-replica mode (no affinity required).** Opt in with `launch(multi_replica=...)` (or the `GRADIO_MULTI_REPLICA` environment variable) to store session state and files in shared backends, so any replica can serve any request. This removes the need for `sessionAffinity`/sticky cookies:
+
+   ```python
+   demo.launch(
+       multi_replica={
+           "session": {"url": os.environ["GRADIO_REDIS_URL"]},
+           "files": {"bucket": "your-org/your-bucket", "token": os.environ["HF_TOKEN"]},
+           "auth_secret": os.environ["GRADIO_AUTH_SECRET"],
+           "queue": {"url": os.environ["GRADIO_REDIS_URL"], "lease_ms": 60000},
+           "drain_window": 20,
+       }
+   )
+   ```
+
+   Multi-replica mode requires:
+   - **A Redis backend** for session state and the durable work queue, supplied by the operator.
+   - **A Hugging Face Storage Bucket** (S3-compatible) for uploaded and generated files.
+   - **`drain_window` less than the queue's `lease_ms`**, so an interrupted job is redelivered after the replica has stopped. Launch fails if this is violated.
+   - **Serializable session state.** Only values the store's typed envelope can represent cross a replica: JSON-native types, plus bytes, `datetime`/`date`/`time`, `Decimal`, `set`, `tuple`, and string/integer dict keys. A value outside this set fails with an error naming the component and its type. Gradio does not fall back to affinity. See the serialization requirement below.
+
+#### Serialization requirement (multi-replica mode)
+
+With an external store configured, a `gr.State` value that cannot be represented by the store's typed envelope is rejected when it is written, with an error naming the state and the value's type. Values that previously survived via silent stringification (for example, arbitrary objects) are no longer accepted. Convert such state to a supported representation (for example, a dict of primitives) before enabling multi-replica mode.
+
+Request-scoped component values do not cross the store; only `gr.State` values do. Component configuration is rebuilt from each replica's own app.
+
+#### Trust boundary and lifecycle (multi-replica mode)
+
+The external store holds every tenant's session state and any secrets kept in `gr.State`, so treat it as a security boundary:
+
+- **Credentials** are operator-supplied and validated at launch; the Redis client is imported only when multi-replica mode is on, so the default install has no extra dependency.
+- **Keys are namespaced** per app and tenant.
+- **Sessions are authorized**, not merely keyed: a session hash that belongs to another principal is a not-found, not a readable session.
+- **Retention:** a closed session is retained for its TTL and then removed, and files orphaned by an expired session are collected.
+- **No `auth=`?** Session and file isolation is limited to the client session identity. Without `auth=`, there is no cross-principal isolation beyond that, so do not rely on multi-replica mode to separate untrusted users.
 
 #### Deploying Behind a Proxy
 

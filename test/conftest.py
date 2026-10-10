@@ -1,4 +1,5 @@
 import inspect
+import os
 import pathlib
 import shutil
 from contextlib import contextmanager
@@ -20,6 +21,10 @@ def pytest_configure(config):
         "markers",
         "requires_ffmpeg: skip the test when ffmpeg or ffprobe is not on PATH",
     )
+    config.addinivalue_line(
+        "markers",
+        "integration: needs a service from test/multi-replica/docker-compose.yml",
+    )
 
 
 def pytest_collection_modifyitems(items):
@@ -36,6 +41,29 @@ def pytest_collection_modifyitems(items):
 @pytest.fixture
 def test_file_dir():
     return pathlib.Path(pathlib.Path(__file__).parent, "test_files")
+
+
+@pytest.fixture
+def real_redis_client():
+    """A real Redis connection for integration tests, or skip.
+
+    Start one with
+    ``docker compose -f test/multi-replica/docker-compose.yml up -d`` and set
+    ``GRADIO_TEST_REDIS_URL=redis://localhost:6379``. Env-gated so the default
+    test run needs no infrastructure.
+    """
+    url = os.getenv("GRADIO_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("set GRADIO_TEST_REDIS_URL to run Redis integration tests")
+    redis = pytest.importorskip("redis")
+    client = redis.Redis.from_url(url, decode_responses=False)
+    try:
+        client.ping()
+    except Exception as exc:
+        pytest.skip(f"GRADIO_TEST_REDIS_URL is not reachable: {exc}")
+    yield client
+    client.flushdb()
+    client.close()
 
 
 @pytest.fixture

@@ -3188,6 +3188,9 @@ def test_mount_gradio_app_args_match_launch_args():
         "i18n",
         "_app",
         "num_workers",
+        # A multi-replica deployment wires stores on the app it builds, not on
+        # an already-configured app being mounted.
+        "multi_replica",
     }
 
     missing_params = []
@@ -3785,3 +3788,240 @@ def test_a_failed_flush_still_ends_the_runs_other_streams(monkeypatch):
         assert "direct" not in demo.pending_diff_streams
     finally:
         demo.close()
+
+
+class TestRequestScopedSessionResolution:
+    """U3: every session read/write routes through the configured store.
+
+    A second store instance over the same backend stands in for a second
+    replica: the store differs while the app config is shared.
+    """
+
+    @staticmethod
+    def _demo():
+        with gr.Blocks() as demo:
+            state = gr.State(0)
+            out = gr.Number()
+            gr.Button().click(lambda s: (s + 1, s + 1), [state], [out, state])
+        return demo, state
+
+    @staticmethod
+    def _store(client, app_id="app-1"):
+        from gradio.session_store import RedisSessionStore
+
+        return RedisSessionStore(client, app_id=app_id)
+
+    @staticmethod
+    def _client():
+        import fakeredis
+
+        return fakeredis.FakeRedis(decode_responses=False)
+
+    def test_session_resolves_on_a_second_store_instance(self):
+        client = self._client()
+        demo, state = self._demo()
+        demo.session_store = self._store(client)
+
+        record = demo.get_session_state("h")
+        assert record is not None
+        record.state_data[state._id] = 7
+        assert demo.save_session_state(record, "h") is True
+
+        demo.session_store = self._store(client)
+        seen = demo.get_session_state("h")
+        assert seen is not None
+        assert seen.state_data[state._id] == 7
+
+    def test_new_session_is_created_once(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+
+        assert demo.get_session_state("h") is not None
+        assert demo.get_session_state("h") is not None
+        assert len(demo.session_store) == 1
+
+    def test_process_api_without_state_resolves_through_the_store(self):
+        client = self._client()
+        demo, state = self._demo()
+        demo.session_store = self._store(client)
+
+        record = demo.session_store.create("h", principal=None)
+        record.state_data[state._id] = 41
+        demo.session_store.save(record, record.version)
+
+        output = asyncio.run(demo.process_api(0, [None], state=None, session_hash="h"))
+        assert output["data"][0] == 42
+        stored = demo.session_store.resolve("h", principal=None)
+        assert stored is not None
+        assert stored.state_data[state._id] == 42
+
+    def test_concurrent_turns_do_not_lose_an_update(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+
+        record = demo.session_store.create("h", principal=None)
+        record.state_data = {0: "a", 1: "b"}
+        demo.session_store.save(record, record.version)
+
+        turn_one = demo.get_session_state("h")
+        turn_two = demo.get_session_state("h")
+        assert turn_one is not None and turn_two is not None
+        turn_one.state_data[0] = "a2"
+        turn_two.state_data[1] = "b2"
+
+        assert demo.save_session_state(turn_one, "h") is True
+        assert demo.save_session_state(turn_two, "h") is True
+        final = demo.session_store.resolve("h", principal=None)
+        assert final is not None
+        assert final.state_data == {0: "a2", 1: "b2"}
+
+    def test_another_principals_session_is_refused(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+        demo.session_store.create("h", principal="alice")
+
+        assert demo.get_session_state("h", "bob", create=True) is None
+        assert demo.get_session_state("h", "bob", create=False) is None
+        assert demo.get_session_state("h", "alice") is not None
+
+    def test_session_close_persists_for_the_external_path(self):
+        client = self._client()
+        demo, _ = self._demo()
+        demo.session_store = self._store(client)
+
+        state = demo.get_session_state("h")
+        assert state is not None
+        state.is_closed = True
+        assert demo.save_session_state(state, "h") is True
+
+        demo.session_store = self._store(client)
+        reopened = demo.get_session_state("h", create=False)
+        assert reopened is not None
+        assert reopened.is_closed is True
+
+    def test_default_path_stays_in_process(self):
+        from gradio.state_holder import StateHolder
+
+        demo, _ = self._demo()
+        holder = StateHolder()
+        holder.set_blocks(demo)
+
+        assert demo.session_store is None
+        first = demo.get_session_state("h")
+        assert first is demo.state_holder["h"]
+        first.state_data[0] = "kept"
+        assert demo.get_session_state("h").state_data[0] == "kept"
+        assert demo.save_session_state(first, "h") is True
+
+
+class TestCrossReplicaAuth:
+    """U6: a login on one replica is recognized on another."""
+
+    def test_token_verifies_on_a_second_instance(self):
+        from gradio.routes import SignedTokenAuth
+
+        alice = SignedTokenAuth("shared-secret")
+        bob = SignedTokenAuth("shared-secret")
+        assert bob.verify(alice.mint("alice")) == "alice"
+
+    def test_tampered_or_wrong_key_token_is_rejected(self):
+        from gradio.routes import SignedTokenAuth
+
+        auth = SignedTokenAuth("shared-secret")
+        token = auth.mint("alice")
+        assert auth.verify(token + "x") is None
+        assert auth.verify(token[:-1]) is None
+        assert SignedTokenAuth("other-secret").verify(token) is None
+        assert auth.verify(None) is None
+
+    def test_expired_token_is_rejected(self):
+        from gradio.routes import SignedTokenAuth
+
+        assert (
+            SignedTokenAuth("shared-secret", ttl=-1).verify(
+                SignedTokenAuth("shared-secret", ttl=-1).mint("alice")
+            )
+            is None
+        )
+
+    def test_logout_propagates_through_shared_revocations(self):
+        from gradio.routes import SignedTokenAuth
+
+        shared: set[str] = set()
+        alice = SignedTokenAuth("shared-secret", revocations=shared)
+        bob = SignedTokenAuth("shared-secret", revocations=shared)
+        token = alice.mint("alice")
+        assert bob.verify(token) == "alice"
+
+        alice.revoke(token)
+        assert bob.verify(token) is None
+
+    def test_default_app_keeps_the_process_local_path(self, monkeypatch):
+        monkeypatch.delenv("GRADIO_AUTH_SECRET", raising=False)
+        with gr.Blocks() as demo:
+            gr.Textbox()
+        app, _, _ = demo.launch(prevent_thread_lock=True)
+        try:
+            assert app.signed_auth is None
+            assert app.tokens == {}
+        finally:
+            demo.close()
+
+    def test_auth_secret_env_alone_does_not_change_default_auth(self, monkeypatch):
+        monkeypatch.setenv("GRADIO_AUTH_SECRET", "secret")
+        with gr.Blocks() as demo:
+            gr.Textbox()
+        app, _, _ = demo.launch(prevent_thread_lock=True, auth=[("alice", "pw")])
+        try:
+            assert app.signed_auth is None
+            assert app.tokens == {}
+        finally:
+            demo.close()
+
+    def test_signed_login_round_trip_and_cookie_trust(self, monkeypatch):
+        monkeypatch.delenv("GRADIO_AUTH_SECRET", raising=False)
+        with gr.Blocks() as demo:
+            gr.Textbox()
+        demo.auth_secret = "s3cret"
+        app, _, _ = demo.launch(prevent_thread_lock=True, auth=[("alice", "pw")])
+        try:
+            assert app.signed_auth is not None
+            client = TestClient(app)
+            response = client.post(
+                "/login", data={"username": "alice", "password": "pw"}
+            )
+            assert response.status_code == 200
+            # Signed mode does not populate the process-local token map.
+            assert app.tokens == {}
+
+            token = app.signed_auth.mint("alice")
+            secure = f"access-token-{app.cookie_id}"
+            unsecure = f"access-token-unsecure-{app.cookie_id}"
+            check = "/gradio_api/login_check"
+
+            # The unsecure cookie is lower trust and must not authenticate.
+            client.cookies.clear()
+            client.cookies.set(unsecure, token)
+            assert client.get(check).status_code == 401
+
+            client.cookies.clear()
+            client.cookies.set(secure, token)
+            assert client.get(check).status_code == 200
+
+            # A tampered secure token is rejected.
+            client.cookies.clear()
+            client.cookies.set(secure, token + "x")
+            assert client.get(check).status_code == 401
+
+            # Logout revokes the presented token server-side, for every replica.
+            client.cookies.clear()
+            client.cookies.set(secure, token)
+            client.get("/logout")
+            client.cookies.clear()
+            client.cookies.set(secure, token)
+            assert client.get(check).status_code == 401
+        finally:
+            demo.close()

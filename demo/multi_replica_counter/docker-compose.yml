@@ -1,0 +1,38 @@
+# 10-replica state-sync demo: Redis + 10 app replicas + round-robin nginx.
+#
+# Start (Docker daemon up, from the repo root):
+#   HF_TOKEN=... GRADIO_FILE_BUCKET=<bucket> \
+#     docker compose -f demo/multi_replica_counter/docker-compose.yml up -d --build --scale app=10
+# Check:
+#   python demo/multi_replica_counter/sync_check.py --turns 20
+# Stop:
+#   docker compose -f demo/multi_replica_counter/docker-compose.yml down
+#
+# The file bucket is required at launch but only touched on file ops; the
+# counter sync check exercises session state only.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      GRADIO_REDIS_URL: redis://redis:6379
+      GRADIO_FILE_BUCKET: ${GRADIO_FILE_BUCKET:?set a Hugging Face Storage Bucket}
+      HF_TOKEN: ${HF_TOKEN:-}
+    depends_on:
+      - redis
+
+  lb:
+    image: nginx:alpine
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app

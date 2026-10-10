@@ -112,9 +112,28 @@ After the image builds Modal will print the URL to your webapp and to your Modal
 ### Sticky Sessions
 Modal Functions are serverless which means that each client request is considered independent. While this facilitates autoscaling, it can also mean that extra care should be taken if your application requires any sort of server-side statefulness.
 
-Gradio relies on a REST API, which is itself stateless. But it does require sticky sessions, meaning that every request from a particular client must be routed to the same container. However, Modal does not make any guarantees in this regard.
+By default, Gradio keeps a session's state, files, `auth=`, and `@gr.render` state in one process, so it requires sticky sessions: every request from a particular client must be routed to the same container. Modal does not make any guarantees in this regard.
 
-A simple way to satisfy this constraint is to set `max_containers = 1` in the `@app.function` decorator and setting the `max_inputs` argument of `@modal.concurrent` to a fairly large number - as we did above. This means that Modal won't spin up more than one container to serve requests to your app which effectively satisfies the sticky session requirement.
+The simplest way to satisfy this constraint in the default mode is to set `max_containers = 1` in the `@app.function` decorator and set the `max_inputs` argument of `@modal.concurrent` to a fairly large number - as we did above. This means that Modal won't spin up more than one container to serve requests to your app, which effectively satisfies the sticky session requirement.
+
+### Removing the sticky-session requirement in multi-replica mode
+If you want Modal to scale your Gradio app across more than one container, opt into multi-replica mode so no request depends on reaching a specific container. Wire the external backends at launch:
+
+```python
+demo.launch(
+    multi_replica={
+        "session": {"url": os.environ["GRADIO_REDIS_URL"]},
+        "files": {"bucket": "your-org/your-bucket", "token": os.environ["HF_TOKEN"]},
+        "auth_secret": os.environ["GRADIO_AUTH_SECRET"],
+        "queue": {"url": os.environ["GRADIO_REDIS_URL"], "lease_ms": 60000},
+        "drain_window": 20,
+    }
+)
+```
+
+With multi-replica mode enabled, `max_containers` may exceed 1 and no sticky sessions are required. The same requirements as the [Docker guide](../deploying-gradio-with-docker.md) apply: an operator-supplied Redis backend, a Hugging Face Storage Bucket for files, `drain_window` less than `lease_ms`, and serializable `gr.State` values. A value the store cannot represent fails loudly rather than falling back to affinity, so convert unsupported state to a supported representation (for example, a dict of primitives) first.
+
+Without multi-replica mode, the default affinity-bound behavior and its `max_containers = 1` guidance above still apply.
 
 ### Concurrency and Queues
 
